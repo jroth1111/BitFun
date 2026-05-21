@@ -1,0 +1,15 @@
+[package]
+name = "cowork-plugin-registry"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+description = "Cowork kernel-owned plugin manifest and capability registry"
+
+[lib]
+name = "cowork_plugin_registry"
+crate-type = ["rlib"]
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

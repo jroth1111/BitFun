@@ -9,6 +9,7 @@ members = [
     "src/crates/services-integrations",
     "src/crates/product-domains",
     "src/crates/cowork-protocol",
+    "src/crates/cowork-plugin-registry",
     "src/crates/agent-tools",
     "src/crates/tool-packs",
     "src/crates/acp",
