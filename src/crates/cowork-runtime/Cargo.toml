@@ -1,0 +1,17 @@
+[package]
+name = "cowork-runtime"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+description = "Cowork autonomous objective runtime and scheduler"
+
+[lib]
+name = "cowork_runtime"
+crate-type = ["rlib"]
+
+[dependencies]
+cowork-ledger = { path = "../cowork-ledger" }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
