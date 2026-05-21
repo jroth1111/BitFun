@@ -55,6 +55,17 @@ pub struct LongHorizonHarnessReport {
     pub final_stop_reason_id: StopReasonId,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DriftRegressionFixtureReport {
+    pub compaction_turns: usize,
+    pub root_rewrite_rejections: usize,
+    pub constraint_drop_rejections: usize,
+    pub evidence_drop_rejections: usize,
+    pub false_completion_rejections: usize,
+    pub blocker_omission_rejections: usize,
+}
+
 pub fn run_long_horizon_harness(
     config: LongHorizonHarnessConfig,
 ) -> Result<LongHorizonHarnessReport, LongHorizonHarnessError> {
@@ -63,6 +74,97 @@ pub fn run_long_horizon_harness(
     verify_repeated_compaction(&ledger, &config)?;
     verify_exact_retrieval_guards(&ledger)?;
     verify_resume_after_restart(&ledger, &config)
+}
+
+pub fn run_drift_regression_fixtures(
+    config: LongHorizonHarnessConfig,
+) -> Result<DriftRegressionFixtureReport, LongHorizonHarnessError> {
+    config.validate()?;
+    let ledger = build_long_horizon_ledger(&config)?;
+    let turns = config.steps + 1;
+    let mut report = DriftRegressionFixtureReport {
+        compaction_turns: turns,
+        root_rewrite_rejections: 0,
+        constraint_drop_rejections: 0,
+        evidence_drop_rejections: 0,
+        false_completion_rejections: 0,
+        blocker_omission_rejections: 0,
+    };
+
+    for turn in 0..turns {
+        let budget = config.compaction_budgets[turn % config.compaction_budgets.len()];
+        let compacted = CoworkFallbackPayload::from_ledger(
+            &ledger,
+            ContextFallbackOptions::new(budget).with_history_hints(Vec::new()),
+        );
+        validate_payload_against_long_horizon_ledger(&ledger, &compacted)?;
+
+        let untrimmed = CoworkFallbackPayload::from_ledger(
+            &ledger,
+            ContextFallbackOptions::new(usize::MAX / 4).with_history_hints(Vec::new()),
+        );
+
+        let mut root_rewrite = untrimmed.clone();
+        root_rewrite.root_observation.objective_text =
+            "Compaction narrowed the objective after the fact.".to_string();
+        expect_fixture_rejection(
+            &ledger,
+            &root_rewrite,
+            "root objective rewrite fixture",
+            &mut report.root_rewrite_rejections,
+        )?;
+
+        let mut constraint_drop = untrimmed.clone();
+        constraint_drop.root_observation.constraints.clear();
+        expect_fixture_rejection(
+            &ledger,
+            &constraint_drop,
+            "root constraint drop fixture",
+            &mut report.constraint_drop_rejections,
+        )?;
+
+        let mut evidence_drop = untrimmed.clone();
+        evidence_drop.evidence.clear();
+        expect_fixture_rejection(
+            &ledger,
+            &evidence_drop,
+            "evidence drop fixture",
+            &mut report.evidence_drop_rejections,
+        )?;
+
+        let mut false_completion = untrimmed.clone();
+        let failed_task_id = task_id(first_failed_attempt_step(config.steps)?)?;
+        let failed_task = false_completion
+            .tasks
+            .iter_mut()
+            .find(|task| task.id == failed_task_id)
+            .ok_or_else(|| {
+                LongHorizonHarnessError::Invariant(
+                    "false-completion fixture missing failed task".to_string(),
+                )
+            })?;
+        failed_task.status = TaskStatus::Verified;
+        expect_fixture_rejection(
+            &ledger,
+            &false_completion,
+            "false completion fixture",
+            &mut report.false_completion_rejections,
+        )?;
+
+        let mut blocker_omission = untrimmed;
+        blocker_omission.blockers.clear();
+        for task in &mut blocker_omission.tasks {
+            task.blocker_ids.clear();
+        }
+        expect_fixture_rejection(
+            &ledger,
+            &blocker_omission,
+            "blocker omission fixture",
+            &mut report.blocker_omission_rejections,
+        )?;
+    }
+
+    Ok(report)
 }
 
 #[derive(Debug)]
@@ -615,6 +717,92 @@ fn assert_failed_attempts_and_blockers_survive_restart(
     Ok(())
 }
 
+fn validate_payload_against_long_horizon_ledger(
+    ledger: &CoworkLedger,
+    payload: &CoworkFallbackPayload,
+) -> Result<(), LongHorizonHarnessError> {
+    if payload.root_observation != ledger.root().observation() {
+        return Err(LongHorizonHarnessError::Invariant(
+            "payload root observation drifted from immutable ledger root".to_string(),
+        ));
+    }
+    if payload.objective_progress != *ledger.objective_progress() {
+        return Err(LongHorizonHarnessError::Invariant(
+            "payload objective progress drifted from ledger progress".to_string(),
+        ));
+    }
+    if payload.token_accounting.original_counts.tasks != ledger.tasks().len()
+        || payload.token_accounting.original_counts.evidence != ledger.evidence().len()
+        || payload.token_accounting.original_counts.blockers != ledger.blockers().len()
+    {
+        return Err(LongHorizonHarnessError::Invariant(
+            "payload original counts lost ledger records".to_string(),
+        ));
+    }
+
+    if payload.evidence.is_empty() {
+        return Err(LongHorizonHarnessError::Invariant(
+            "payload dropped every evidence record".to_string(),
+        ));
+    }
+    if payload.token_accounting.trimmed_counts.evidence == 0
+        && payload.evidence.len() != ledger.evidence().len()
+    {
+        return Err(LongHorizonHarnessError::Invariant(
+            "untrimmed payload lost evidence records".to_string(),
+        ));
+    }
+    if payload.token_accounting.trimmed_counts.blockers == 0
+        && payload.blockers.len() != ledger.blockers().len()
+    {
+        return Err(LongHorizonHarnessError::Invariant(
+            "untrimmed payload lost blocker records".to_string(),
+        ));
+    }
+
+    for task in &payload.tasks {
+        let ledger_task = ledger.tasks().get(&task.id).ok_or_else(|| {
+            LongHorizonHarnessError::Invariant(format!("payload invented task {}", task.id))
+        })?;
+        if task.status != ledger_task.status {
+            return Err(LongHorizonHarnessError::Invariant(format!(
+                "payload task {} status drifted from {:?} to {:?}",
+                task.id, ledger_task.status, task.status
+            )));
+        }
+        if task.evidence_ids != ledger_task.evidence_ids
+            || task.artifact_ids != ledger_task.artifact_ids
+            || task.checkpoint_ids != ledger_task.checkpoint_ids
+            || task.blocker_ids != ledger_task.blocker_ids
+        {
+            return Err(LongHorizonHarnessError::Invariant(format!(
+                "payload task {} lost ledger links",
+                task.id
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn expect_fixture_rejection(
+    ledger: &CoworkLedger,
+    payload: &CoworkFallbackPayload,
+    fixture_name: &str,
+    counter: &mut usize,
+) -> Result<(), LongHorizonHarnessError> {
+    match validate_payload_against_long_horizon_ledger(ledger, payload) {
+        Ok(()) => Err(LongHorizonHarnessError::Invariant(format!(
+            "{fixture_name} was accepted"
+        ))),
+        Err(LongHorizonHarnessError::Invariant(_)) => {
+            *counter += 1;
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn failed_tool_attempt_count(ledger: &CoworkLedger) -> usize {
     ledger
         .evidence()
@@ -747,5 +935,18 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(error, LongHorizonHarnessError::InvalidConfig(_)));
+    }
+
+    #[test]
+    fn drift_regression_fixtures_reject_broken_compaction_outputs() {
+        let report = run_drift_regression_fixtures(LongHorizonHarnessConfig::default())
+            .expect("drift fixtures");
+
+        assert_eq!(report.compaction_turns, DEFAULT_STEPS + 1);
+        assert_eq!(report.root_rewrite_rejections, DEFAULT_STEPS + 1);
+        assert_eq!(report.constraint_drop_rejections, DEFAULT_STEPS + 1);
+        assert_eq!(report.evidence_drop_rejections, DEFAULT_STEPS + 1);
+        assert_eq!(report.false_completion_rejections, DEFAULT_STEPS + 1);
+        assert_eq!(report.blocker_omission_rejections, DEFAULT_STEPS + 1);
     }
 }
