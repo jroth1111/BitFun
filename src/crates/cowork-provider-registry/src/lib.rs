@@ -4,10 +4,10 @@
 //! Prompt-visible exports receive opaque handles, credential state, and routing
 //! metadata; raw provider keys only pass through vault store/retrieve APIs.
 
-use cowork_protocol::{
-    Provider, ProviderAuthMethod, ProviderCapability, ProviderCost, ProviderCredentialState,
-    ProviderCredentialStatus, ProviderKind, ProviderRateLimits, ProviderRoutingMetadata,
-    ProviderStatus, ProviderToolSupport,
+use cowork_protocol::{Provider, ProviderCredentialStatus};
+pub use cowork_protocol::{
+    ProviderAuthMethod, ProviderCapability, ProviderCost, ProviderCredentialState, ProviderKind,
+    ProviderRateLimits, ProviderRoutingMetadata, ProviderStatus, ProviderToolSupport,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -273,11 +273,58 @@ pub enum ProviderRegistryError {
         provider_id: String,
         missing: Vec<ProviderCapability>,
     },
+    #[error("provider requirement mismatch for {provider_id}")]
+    RequirementMismatch {
+        provider_id: String,
+        mismatch: ProviderCapabilityMismatch,
+    },
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct ProviderRegistry {
     providers: BTreeMap<String, Provider>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderCapabilityRequirement {
+    pub capabilities: Vec<ProviderCapability>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_context_window_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_max_output_tokens: Option<u32>,
+    pub tool_support: ProviderToolSupport,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderCapabilityMismatch {
+    pub missing_capabilities: Vec<ProviderCapability>,
+    pub missing_tool_support: Vec<ProviderToolFeature>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub required_context_window_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actual_context_window_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub required_max_output_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actual_max_output_tokens: Option<u32>,
+}
+
+impl ProviderCapabilityMismatch {
+    pub fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderToolFeature {
+    ToolUse,
+    FileInput,
+    FileOutput,
+    Vision,
+    Streaming,
 }
 
 impl ProviderRegistry {
@@ -327,6 +374,116 @@ impl ProviderRegistry {
                 missing,
             })
         }
+    }
+
+    pub fn ensure_requirement(
+        &self,
+        provider_id: &str,
+        requirement: &ProviderCapabilityRequirement,
+    ) -> Result<(), ProviderRegistryError> {
+        let provider = self.providers.get(provider_id).ok_or_else(|| {
+            ProviderRegistryError::ProviderNotFound {
+                provider_id: provider_id.to_string(),
+            }
+        })?;
+        let mismatch = requirement_mismatch(provider, requirement);
+        if mismatch.is_empty() {
+            Ok(())
+        } else {
+            Err(ProviderRegistryError::RequirementMismatch {
+                provider_id: provider_id.to_string(),
+                mismatch,
+            })
+        }
+    }
+}
+
+fn requirement_mismatch(
+    provider: &Provider,
+    requirement: &ProviderCapabilityRequirement,
+) -> ProviderCapabilityMismatch {
+    let missing_capabilities = requirement
+        .capabilities
+        .iter()
+        .copied()
+        .filter(|required| !provider.capabilities.contains(required))
+        .collect::<Vec<_>>();
+
+    let mut missing_tool_support = Vec::new();
+    collect_missing_tool_support(
+        requirement.tool_support.tool_use,
+        provider.routing.tool_support.tool_use,
+        ProviderToolFeature::ToolUse,
+        &mut missing_tool_support,
+    );
+    collect_missing_tool_support(
+        requirement.tool_support.file_input,
+        provider.routing.tool_support.file_input,
+        ProviderToolFeature::FileInput,
+        &mut missing_tool_support,
+    );
+    collect_missing_tool_support(
+        requirement.tool_support.file_output,
+        provider.routing.tool_support.file_output,
+        ProviderToolFeature::FileOutput,
+        &mut missing_tool_support,
+    );
+    collect_missing_tool_support(
+        requirement.tool_support.vision,
+        provider.routing.tool_support.vision,
+        ProviderToolFeature::Vision,
+        &mut missing_tool_support,
+    );
+    collect_missing_tool_support(
+        requirement.tool_support.streaming,
+        provider.routing.tool_support.streaming,
+        ProviderToolFeature::Streaming,
+        &mut missing_tool_support,
+    );
+
+    let context_mismatch = requirement
+        .min_context_window_tokens
+        .zip(provider.routing.context_window_tokens)
+        .filter(|(required, actual)| actual < required);
+    let missing_context = requirement
+        .min_context_window_tokens
+        .filter(|_| provider.routing.context_window_tokens.is_none());
+    let max_output_mismatch = requirement
+        .min_max_output_tokens
+        .zip(provider.routing.max_output_tokens)
+        .filter(|(required, actual)| actual < required);
+    let missing_max_output = requirement
+        .min_max_output_tokens
+        .filter(|_| provider.routing.max_output_tokens.is_none());
+
+    ProviderCapabilityMismatch {
+        missing_capabilities,
+        missing_tool_support,
+        required_context_window_tokens: context_mismatch
+            .map(|(required, _)| required)
+            .or(missing_context),
+        actual_context_window_tokens: context_mismatch.map(|(_, actual)| actual).or(provider
+            .routing
+            .context_window_tokens
+            .filter(|_| missing_context.is_some())),
+        required_max_output_tokens: max_output_mismatch
+            .map(|(required, _)| required)
+            .or(missing_max_output),
+        actual_max_output_tokens: max_output_mismatch.map(|(_, actual)| actual).or(provider
+            .routing
+            .max_output_tokens
+            .filter(|_| missing_max_output.is_some())),
+    }
+}
+
+fn collect_missing_tool_support(
+    required: bool,
+    actual: bool,
+    feature: ProviderToolFeature,
+    missing: &mut Vec<ProviderToolFeature>,
+) {
+    if required && !actual {
+        missing.push(feature);
     }
 }
 
@@ -495,5 +652,54 @@ mod tests {
                 missing
             } if provider_id == "openai-compatible" && missing == vec![ProviderCapability::Vision]
         ));
+    }
+
+    #[test]
+    fn multidimensional_requirement_reports_precise_mismatch() {
+        let handle = CredentialHandle::for_provider("openai-compatible", "api-key")
+            .expect("synthetic handle");
+        let mut registry = ProviderRegistry::default();
+        registry
+            .register(registration(handle))
+            .expect("provider registration");
+
+        let requirement = ProviderCapabilityRequirement {
+            capabilities: vec![ProviderCapability::Text, ProviderCapability::Vision],
+            min_context_window_tokens: Some(200_000),
+            min_max_output_tokens: Some(32_000),
+            tool_support: ProviderToolSupport {
+                tool_use: true,
+                file_input: true,
+                file_output: true,
+                vision: true,
+                streaming: true,
+            },
+        };
+
+        let error = registry
+            .ensure_requirement("openai-compatible", &requirement)
+            .expect_err("vision, context, output, and file-output support should be missing");
+
+        match error {
+            ProviderRegistryError::RequirementMismatch {
+                provider_id,
+                mismatch,
+            } => {
+                assert_eq!(provider_id, "openai-compatible");
+                assert_eq!(
+                    mismatch.missing_capabilities,
+                    vec![ProviderCapability::Vision]
+                );
+                assert_eq!(
+                    mismatch.missing_tool_support,
+                    vec![ProviderToolFeature::FileOutput, ProviderToolFeature::Vision]
+                );
+                assert_eq!(mismatch.required_context_window_tokens, Some(200_000));
+                assert_eq!(mismatch.actual_context_window_tokens, Some(128_000));
+                assert_eq!(mismatch.required_max_output_tokens, Some(32_000));
+                assert_eq!(mismatch.actual_max_output_tokens, Some(16_384));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 }

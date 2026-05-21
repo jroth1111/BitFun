@@ -5,9 +5,14 @@
 
 use chrono::Utc;
 use cowork_ledger::{
-    ActorRef, ArtifactId, BlockerId, CoworkLedger, EntityRef, Evidence, EvidenceId, EvidenceKind,
-    EvidenceResult, LedgerError, LedgerUpdate, Metadata, ObjectiveProgressUpdate, ObjectiveStatus,
-    StopReasonId, StopReasonKind, StopReasonRecord, Task, TaskId, TaskStatus, TaskStatusUpdate,
+    ActorRef, ArtifactId, Blocker, BlockerId, BlockerStatus, CoworkLedger, EntityRef, Evidence,
+    EvidenceId, EvidenceKind, EvidenceResult, LedgerError, LedgerUpdate, Metadata,
+    ObjectiveProgressUpdate, ObjectiveStatus, StopReasonId, StopReasonKind, StopReasonRecord, Task,
+    TaskId, TaskStatus, TaskStatusUpdate,
+};
+use cowork_provider_registry::{
+    ProviderCapabilityMismatch, ProviderCapabilityRequirement, ProviderRegistry,
+    ProviderRegistryError,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -31,6 +36,7 @@ pub enum RuntimeStopKind {
     RepairLoopExhausted,
     SubmitReportRequired,
     SubmitReportRejected,
+    ProviderCapabilityMismatch,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -91,6 +97,22 @@ pub struct ToolResult {
     pub evidence_summary: Option<String>,
     pub evidence_result: EvidenceResult,
     pub model_message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderAssignmentRequirement {
+    pub provider_id: String,
+    pub requirement: ProviderCapabilityRequirement,
+}
+
+impl ProviderAssignmentRequirement {
+    pub fn new(provider_id: impl Into<String>, requirement: ProviderCapabilityRequirement) -> Self {
+        Self {
+            provider_id: provider_id.into(),
+            requirement,
+        }
+    }
 }
 
 impl ToolResult {
@@ -421,6 +443,8 @@ pub struct CoworkRuntime<D> {
     attempts: BTreeMap<TaskId, u32>,
     pending_repair: Option<PendingRepair>,
     cancel_requested: bool,
+    provider_registry: Option<ProviderRegistry>,
+    provider_requirements: BTreeMap<TaskId, ProviderAssignmentRequirement>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -446,7 +470,23 @@ where
             attempts: BTreeMap::new(),
             pending_repair: None,
             cancel_requested: false,
+            provider_registry: None,
+            provider_requirements: BTreeMap::new(),
         }
+    }
+
+    pub fn with_provider_registry(mut self, registry: ProviderRegistry) -> Self {
+        self.provider_registry = Some(registry);
+        self
+    }
+
+    pub fn with_provider_requirement(
+        mut self,
+        task_id: TaskId,
+        requirement: ProviderAssignmentRequirement,
+    ) -> Self {
+        self.provider_requirements.insert(task_id, requirement);
+        self
     }
 
     pub fn request_cancel(&mut self) {
@@ -520,6 +560,9 @@ where
             };
 
             self.selected_task_id.get_or_insert_with(|| task.id.clone());
+            if let Some(stop) = self.provider_capability_block(&task)? {
+                return Ok(self.finish(stop));
+            }
             self.ensure_in_progress(&task)?;
 
             if let Some(summary) = self.delegation_guard_violation(&task) {
@@ -734,6 +777,148 @@ where
         }
 
         None
+    }
+
+    fn provider_capability_block(
+        &mut self,
+        task: &Task,
+    ) -> Result<Option<RuntimeStop>, LedgerError> {
+        let Some(requirement) = self.provider_requirements.get(&task.id).cloned() else {
+            return Ok(None);
+        };
+        let Some(registry) = &self.provider_registry else {
+            let mut metadata = runtime_metadata("provider_registry_unavailable");
+            metadata.insert(
+                "providerId".to_string(),
+                serde_json::Value::String(requirement.provider_id.clone()),
+            );
+            let summary = format!(
+                "Provider registry is unavailable before assigning task '{}'.",
+                task.id
+            );
+            return self
+                .block_task_for_provider_requirement(task, &summary, metadata)
+                .map(Some);
+        };
+
+        match registry.ensure_requirement(&requirement.provider_id, &requirement.requirement) {
+            Ok(()) => Ok(None),
+            Err(ProviderRegistryError::ProviderNotFound { provider_id }) => {
+                let mut metadata = runtime_metadata("provider_not_found");
+                metadata.insert(
+                    "providerId".to_string(),
+                    serde_json::Value::String(provider_id.clone()),
+                );
+                let summary =
+                    format!("Provider '{provider_id}' is unavailable before task assignment.");
+                self.block_task_for_provider_requirement(task, &summary, metadata)
+                    .map(Some)
+            }
+            Err(ProviderRegistryError::RequirementMismatch {
+                provider_id,
+                mismatch,
+            }) => {
+                let summary = provider_mismatch_summary(&provider_id, &mismatch);
+                let mut metadata = runtime_metadata("provider_capability_mismatch");
+                metadata.insert(
+                    "providerId".to_string(),
+                    serde_json::Value::String(provider_id),
+                );
+                metadata.insert(
+                    "mismatch".to_string(),
+                    serde_json::to_value(&mismatch).expect("provider mismatch serializes"),
+                );
+                self.block_task_for_provider_requirement(task, &summary, metadata)
+                    .map(Some)
+            }
+            Err(ProviderRegistryError::CapabilityMismatch {
+                provider_id,
+                missing,
+            }) => {
+                let mut metadata = runtime_metadata("provider_capability_mismatch");
+                metadata.insert(
+                    "providerId".to_string(),
+                    serde_json::Value::String(provider_id.clone()),
+                );
+                metadata.insert(
+                    "missingCapabilities".to_string(),
+                    serde_json::to_value(&missing).expect("provider capabilities serialize"),
+                );
+                let summary = format!(
+                    "Provider '{provider_id}' is missing required capabilities before task assignment."
+                );
+                self.block_task_for_provider_requirement(task, &summary, metadata)
+                    .map(Some)
+            }
+            Err(ProviderRegistryError::DuplicateProvider { provider_id }) => {
+                let mut metadata = runtime_metadata("provider_registry_invalid");
+                metadata.insert(
+                    "providerId".to_string(),
+                    serde_json::Value::String(provider_id.clone()),
+                );
+                let summary = format!(
+                    "Provider registry contains duplicate provider '{provider_id}' before task assignment."
+                );
+                self.block_task_for_provider_requirement(task, &summary, metadata)
+                    .map(Some)
+            }
+            Err(ProviderRegistryError::InvalidProviderId) => {
+                let summary =
+                    "Provider registry contains an invalid provider id before task assignment.";
+                self.block_task_for_provider_requirement(
+                    task,
+                    summary,
+                    runtime_metadata("provider_registry_invalid"),
+                )
+                .map(Some)
+            }
+        }
+    }
+
+    fn block_task_for_provider_requirement(
+        &mut self,
+        task: &Task,
+        summary: &str,
+        metadata: Metadata,
+    ) -> Result<RuntimeStop, LedgerError> {
+        let blocker_id = self.next_blocker_id(format!("provider-capability-{}", self.turns))?;
+        self.ledger
+            .apply_update(LedgerUpdate::RecordBlocker(Blocker {
+                id: blocker_id.clone(),
+                summary: summary.to_string(),
+                status: BlockerStatus::Open,
+                opened_at: Utc::now(),
+                resolved_at: None,
+                task_ids: vec![task.id.clone()],
+                required_external_input: vec![
+                    "Select a provider whose capabilities satisfy this task before assignment."
+                        .to_string(),
+                ],
+                evidence_ids: Vec::new(),
+                metadata,
+            }))?;
+
+        let stop_reason_id =
+            self.record_task_stop_reason(&task.id, StopReasonKind::BlockedExternalInput, summary)?;
+        self.ledger
+            .apply_update(LedgerUpdate::UpdateTaskStatus(TaskStatusUpdate {
+                task_id: task.id.clone(),
+                status: TaskStatus::Blocked,
+                updated_at: Utc::now(),
+                updated_by: self.actor.clone(),
+                evidence_ids: Vec::new(),
+                blocker_ids: vec![blocker_id],
+                stop_reason_id: Some(stop_reason_id.clone()),
+                verification_waiver_id: None,
+                metadata: runtime_metadata("provider_capability_blocked"),
+            }))?;
+
+        Ok(RuntimeStop {
+            kind: RuntimeStopKind::ProviderCapabilityMismatch,
+            turns: self.turns,
+            task_id: Some(task.id.to_string()),
+            stop_reason_id: Some(stop_reason_id.to_string()),
+        })
     }
 
     fn record_tool_evidence(
@@ -1267,6 +1452,21 @@ where
         unreachable!("unbounded suffix search returns once an evidence id is free")
     }
 
+    fn next_blocker_id(&self, base: String) -> Result<BlockerId, LedgerError> {
+        let first = BlockerId::parse(format!("blocker/{base}"))?;
+        if !self.ledger.blockers().contains_key(&first) {
+            return Ok(first);
+        }
+
+        for suffix in 2.. {
+            let candidate = BlockerId::parse(format!("blocker/{base}-{suffix}"))?;
+            if !self.ledger.blockers().contains_key(&candidate) {
+                return Ok(candidate);
+            }
+        }
+        unreachable!("unbounded suffix search returns once a blocker id is free")
+    }
+
     fn stop_objective(
         &mut self,
         kind: RuntimeStopKind,
@@ -1410,6 +1610,38 @@ fn metadata_u32(metadata: &Metadata, key: &str) -> Option<u32> {
         .and_then(|value| u32::try_from(value).ok())
 }
 
+fn provider_mismatch_summary(provider_id: &str, mismatch: &ProviderCapabilityMismatch) -> String {
+    let mut parts = Vec::new();
+    if !mismatch.missing_capabilities.is_empty() {
+        parts.push(format!(
+            "missing capabilities {:?}",
+            mismatch.missing_capabilities
+        ));
+    }
+    if !mismatch.missing_tool_support.is_empty() {
+        parts.push(format!(
+            "missing tool support {:?}",
+            mismatch.missing_tool_support
+        ));
+    }
+    if let Some(required) = mismatch.required_context_window_tokens {
+        parts.push(format!(
+            "context window {:?} below required {required}",
+            mismatch.actual_context_window_tokens
+        ));
+    }
+    if let Some(required) = mismatch.required_max_output_tokens {
+        parts.push(format!(
+            "max output {:?} below required {required}",
+            mismatch.actual_max_output_tokens
+        ));
+    }
+    format!(
+        "Provider '{provider_id}' does not satisfy task assignment requirements: {}.",
+        parts.join(", ")
+    )
+}
+
 fn push_unique<T>(values: &mut Vec<T>, value: T)
 where
     T: PartialEq,
@@ -1446,6 +1678,7 @@ fn runtime_stop_slug(kind: RuntimeStopKind) -> &'static str {
         RuntimeStopKind::RepairLoopExhausted => "repair-loop-exhausted",
         RuntimeStopKind::SubmitReportRequired => "submit-report-required",
         RuntimeStopKind::SubmitReportRejected => "submit-report-rejected",
+        RuntimeStopKind::ProviderCapabilityMismatch => "provider-capability-mismatch",
     }
 }
 
@@ -1496,6 +1729,12 @@ mod tests {
         ActorKind, Artifact, ArtifactKind, Blocker, BlockerStatus, ConstraintSeverity,
         ConstraintSource, LedgerInitialization, RootConstraintId, RootConstraintInitialization,
         RootObjectiveId,
+    };
+    use cowork_provider_registry::{
+        routing_metadata, CredentialHandle, ProviderAuthMethod, ProviderCapability,
+        ProviderCapabilityRequirement, ProviderCost, ProviderCredentialBinding, ProviderKind,
+        ProviderRateLimits, ProviderRegistration, ProviderRegistry, ProviderStatus,
+        ProviderToolSupport,
     };
 
     fn actor() -> ActorRef {
@@ -1741,6 +1980,69 @@ mod tests {
         .expect("runtime run")
     }
 
+    fn provider_registry_with_capabilities(
+        capabilities: Vec<ProviderCapability>,
+    ) -> ProviderRegistry {
+        let handle =
+            CredentialHandle::for_provider("runtime-provider", "api-key").expect("provider handle");
+        let mut registry = ProviderRegistry::default();
+        registry
+            .register(ProviderRegistration {
+                id: "runtime-provider".to_string(),
+                kind: ProviderKind::OpenAiCompatible,
+                label: "runtime provider".to_string(),
+                status: ProviderStatus::Available,
+                selected_model: Some("runtime-model".to_string()),
+                capabilities,
+                credential: ProviderCredentialBinding::available(
+                    ProviderAuthMethod::ApiKey,
+                    handle,
+                    "runtime-provider-key",
+                ),
+                routing: routing_metadata(
+                    128_000,
+                    16_384,
+                    ProviderToolSupport {
+                        tool_use: true,
+                        file_input: true,
+                        file_output: false,
+                        vision: false,
+                        streaming: true,
+                    },
+                    ProviderRateLimits {
+                        requests_per_minute: Some(120),
+                        tokens_per_minute: Some(1_000_000),
+                    },
+                    ProviderCost {
+                        currency: Some("USD".to_string()),
+                        input_per_million_micros: Some(250_000),
+                        output_per_million_micros: Some(1_000_000),
+                        cached_input_per_million_micros: Some(25_000),
+                    },
+                ),
+            })
+            .expect("register runtime provider");
+        registry
+    }
+
+    fn provider_requirement() -> ProviderAssignmentRequirement {
+        ProviderAssignmentRequirement::new(
+            "runtime-provider",
+            ProviderCapabilityRequirement {
+                capabilities: vec![ProviderCapability::Text, ProviderCapability::ToolUse],
+                min_context_window_tokens: Some(64_000),
+                min_max_output_tokens: Some(8_000),
+                tool_support: ProviderToolSupport {
+                    tool_use: true,
+                    file_input: true,
+                    file_output: false,
+                    vision: false,
+                    streaming: true,
+                },
+            },
+        )
+    }
+
     #[test]
     fn selects_next_task_records_tool_evidence_and_verifies_with_typed_stop() {
         let (ledger, report) = run_with(vec![ToolResult::passed("tool call passed").into()]);
@@ -1761,6 +2063,77 @@ mod tests {
             reason.kind == StopReasonKind::Verified
                 && reason.subjects == vec![EntityRef::Task(task_id())]
         }));
+    }
+
+    #[test]
+    fn provider_capability_guard_allows_assignment_when_requirement_matches() {
+        let runtime = CoworkRuntime::new(
+            ledger_with_task(TaskStatus::NotStarted),
+            SequenceDriver::new(vec![ToolResult::passed("provider assignment passed").into()]),
+            RuntimeOptions::default(),
+            actor(),
+        )
+        .with_provider_registry(provider_registry_with_capabilities(vec![
+            ProviderCapability::Text,
+            ProviderCapability::ToolUse,
+            ProviderCapability::FileInput,
+            ProviderCapability::Streaming,
+        ]))
+        .with_provider_requirement(task_id(), provider_requirement());
+
+        let (ledger, report) = runtime.run().expect("runtime run");
+
+        assert_eq!(report.tool_calls, 1);
+        assert_eq!(report.final_task_status, Some(TaskStatus::Verified));
+        assert_eq!(
+            ledger.tasks().get(&task_id()).expect("task").status,
+            TaskStatus::Verified
+        );
+        assert!(ledger.blockers().is_empty());
+    }
+
+    #[test]
+    fn provider_capability_guard_blocks_before_driver_execution_on_mismatch() {
+        let runtime = CoworkRuntime::new(
+            ledger_with_task(TaskStatus::NotStarted),
+            SequenceDriver::new(vec![ToolResult::passed("should not execute").into()]),
+            RuntimeOptions::default(),
+            actor(),
+        )
+        .with_provider_registry(provider_registry_with_capabilities(vec![
+            ProviderCapability::Text,
+            ProviderCapability::FileInput,
+            ProviderCapability::Streaming,
+        ]))
+        .with_provider_requirement(task_id(), provider_requirement());
+
+        let (ledger, report) = runtime.run().expect("runtime run");
+        let task = ledger.tasks().get(&task_id()).expect("task");
+        let blocker = ledger.blockers().values().next().expect("blocker");
+
+        assert_eq!(
+            report.stop.kind,
+            RuntimeStopKind::ProviderCapabilityMismatch
+        );
+        assert_eq!(report.tool_calls, 0);
+        assert_eq!(task.status, TaskStatus::Blocked);
+        assert_eq!(task.blocker_ids, vec![blocker.id.clone()]);
+        assert_eq!(blocker.status, BlockerStatus::Open);
+        assert_eq!(
+            blocker.metadata.get("runtimeEvent"),
+            Some(&serde_json::json!("provider_capability_mismatch"))
+        );
+        assert_eq!(
+            blocker
+                .metadata
+                .get("mismatch")
+                .and_then(|value| value.get("missingCapabilities")),
+            Some(&serde_json::json!(["tool_use"]))
+        );
+        assert!(ledger
+            .evidence()
+            .values()
+            .all(|evidence| !evidence.summary.contains("should not execute")));
     }
 
     #[test]
