@@ -22,6 +22,7 @@ pub enum RuntimeStopKind {
     Verified,
     NoReadyTask,
     Cancelled,
+    DelegationLoopGuard,
     MaxTurnsReached,
     BudgetExceeded,
     Failed,
@@ -48,6 +49,7 @@ pub struct SyntheticRunReport {
     pub selected_task_id: Option<String>,
     pub tool_calls: u32,
     pub evidence_records: usize,
+    pub cleanup_records: usize,
     pub stop_reasons: usize,
     pub repaired_after_failure: bool,
     pub final_task_status: Option<TaskStatus>,
@@ -58,6 +60,8 @@ pub struct RuntimeOptions {
     pub max_turns: u32,
     pub budget_limit: u32,
     pub max_repair_attempts: u32,
+    pub max_delegation_depth: u32,
+    pub max_repeated_child_delegations: u32,
 }
 
 impl Default for RuntimeOptions {
@@ -66,6 +70,8 @@ impl Default for RuntimeOptions {
             max_turns: 16,
             budget_limit: 16,
             max_repair_attempts: 1,
+            max_delegation_depth: 4,
+            max_repeated_child_delegations: 2,
         }
     }
 }
@@ -382,6 +388,17 @@ where
             self.selected_task_id.get_or_insert_with(|| task.id.clone());
             self.ensure_in_progress(&task)?;
 
+            if let Some(summary) = self.delegation_guard_violation(&task) {
+                let stop = self.stop_task(
+                    &task.id,
+                    RuntimeStopKind::DelegationLoopGuard,
+                    TaskStatus::Failed,
+                    StopReasonKind::Failed,
+                    &summary,
+                )?;
+                return Ok(self.finish(stop));
+            }
+
             let attempt = *self.attempts.entry(task.id.clone()).or_insert(0);
             self.turns += 1;
             self.tool_calls += 1;
@@ -473,11 +490,20 @@ where
             selected_task_id,
             tool_calls: self.tool_calls,
             evidence_records: self.ledger.evidence().len(),
+            cleanup_records: self.cleanup_records(),
             stop_reasons: self.ledger.stop_reasons().len(),
             repaired_after_failure: self.repaired_after_failure,
             final_task_status,
         };
         (self.ledger, report)
+    }
+
+    fn cleanup_records(&self) -> usize {
+        self.ledger
+            .evidence()
+            .values()
+            .filter(|evidence| is_cleanup_evidence(evidence))
+            .count()
     }
 
     fn ensure_in_progress(&mut self, task: &Task) -> Result<(), LedgerError> {
@@ -498,6 +524,26 @@ where
                 metadata: runtime_metadata("selected"),
             }))?;
         Ok(())
+    }
+
+    fn delegation_guard_violation(&self, task: &Task) -> Option<String> {
+        let depth = metadata_u32(&task.metadata, "delegationDepth").unwrap_or(0);
+        if depth > self.options.max_delegation_depth {
+            return Some(format!(
+                "Delegation depth {depth} exceeds max delegation depth {}.",
+                self.options.max_delegation_depth
+            ));
+        }
+
+        let repeated = metadata_u32(&task.metadata, "delegationRepeatCount").unwrap_or(0);
+        if repeated > self.options.max_repeated_child_delegations {
+            return Some(format!(
+                "Repeated child delegation count {repeated} exceeds max repeated child delegations {}.",
+                self.options.max_repeated_child_delegations
+            ));
+        }
+
+        None
     }
 
     fn record_tool_evidence(
@@ -575,7 +621,8 @@ where
                     evidence_id.clone(),
                 ));
             };
-            has_passed_evidence |= evidence.result == EvidenceResult::Passed;
+            has_passed_evidence |=
+                evidence.result == EvidenceResult::Passed && !is_cleanup_evidence(evidence);
         }
         if report.status == SubmitReportStatus::Verified && !has_passed_evidence {
             return Err(SubmitReportRejection::VerifiedWithoutPassedEvidence);
@@ -714,13 +761,18 @@ where
             .expect("runtime selected an existing task")
             .clone();
         let stop_reason_id = self.record_task_stop_reason(task_id, stop_kind, summary)?;
+        let evidence_ids = if task_status_requires_cleanup(status) {
+            vec![self.record_cleanup_evidence(task_id, kind, status, summary)?]
+        } else {
+            Vec::new()
+        };
         self.ledger
             .apply_update(LedgerUpdate::UpdateTaskStatus(TaskStatusUpdate {
                 task_id: task_id.clone(),
                 status,
                 updated_at: Utc::now(),
                 updated_by: self.actor.clone(),
-                evidence_ids: Vec::new(),
+                evidence_ids,
                 blocker_ids: task.blocker_ids,
                 stop_reason_id: Some(stop_reason_id.clone()),
                 verification_waiver_id: None,
@@ -732,6 +784,52 @@ where
             task_id: Some(task_id.to_string()),
             stop_reason_id: Some(stop_reason_id.to_string()),
         })
+    }
+
+    fn record_cleanup_evidence(
+        &mut self,
+        task_id: &TaskId,
+        stop_kind: RuntimeStopKind,
+        status: TaskStatus,
+        summary: &str,
+    ) -> Result<EvidenceId, LedgerError> {
+        let evidence_id = EvidenceId::parse(format!(
+            "evidence/runtime-cleanup-{}-{}",
+            self.turns,
+            runtime_stop_slug(stop_kind)
+        ))?;
+        let mut metadata = runtime_metadata("cleanup");
+        metadata.insert(
+            "cleanupStopKind".to_string(),
+            serde_json::to_value(stop_kind).expect("RuntimeStopKind serializes"),
+        );
+        metadata.insert(
+            "cleanupTaskStatus".to_string(),
+            serde_json::to_value(status).expect("TaskStatus serializes"),
+        );
+        metadata.insert(
+            "cleanupSummary".to_string(),
+            serde_json::Value::String(summary.to_string()),
+        );
+        metadata.insert(
+            "parentCancellationPropagated".to_string(),
+            serde_json::Value::Bool(stop_kind == RuntimeStopKind::Cancelled),
+        );
+        self.ledger
+            .apply_update(LedgerUpdate::RecordEvidence(Evidence {
+                id: evidence_id.clone(),
+                kind: EvidenceKind::Inspection,
+                summary: format!("Runtime cleanup completed after {stop_kind:?}: {summary}"),
+                collected_at: Utc::now(),
+                collected_by: self.actor.clone(),
+                result: EvidenceResult::Passed,
+                subjects: vec![EntityRef::Task(task_id.clone())],
+                command: None,
+                source_refs: Vec::new(),
+                artifact_ids: Vec::new(),
+                metadata,
+            }))?;
+        Ok(evidence_id)
     }
 
     fn stop_objective(
@@ -858,6 +956,25 @@ fn task_requires_submit_report(task: &Task) -> bool {
         .unwrap_or(false)
 }
 
+fn task_status_requires_cleanup(status: TaskStatus) -> bool {
+    matches!(status, TaskStatus::Cancelled | TaskStatus::Failed)
+}
+
+fn is_cleanup_evidence(evidence: &Evidence) -> bool {
+    evidence
+        .metadata
+        .get("runtimeEvent")
+        .and_then(serde_json::Value::as_str)
+        == Some("cleanup")
+}
+
+fn metadata_u32(metadata: &Metadata, key: &str) -> Option<u32> {
+    metadata
+        .get(key)
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+}
+
 fn push_unique<T>(values: &mut Vec<T>, value: T)
 where
     T: PartialEq,
@@ -877,6 +994,21 @@ fn kind_slug(kind: StopReasonKind) -> &'static str {
         StopReasonKind::Descoped => "descoped",
         StopReasonKind::Cancelled => "cancelled",
         StopReasonKind::Failed => "failed",
+    }
+}
+
+fn runtime_stop_slug(kind: RuntimeStopKind) -> &'static str {
+    match kind {
+        RuntimeStopKind::Verified => "verified",
+        RuntimeStopKind::NoReadyTask => "no-ready-task",
+        RuntimeStopKind::Cancelled => "cancelled",
+        RuntimeStopKind::DelegationLoopGuard => "delegation-loop-guard",
+        RuntimeStopKind::MaxTurnsReached => "max-turns-reached",
+        RuntimeStopKind::BudgetExceeded => "budget-exceeded",
+        RuntimeStopKind::Failed => "failed",
+        RuntimeStopKind::ModelMessageWithoutEvidence => "model-message-without-evidence",
+        RuntimeStopKind::SubmitReportRequired => "submit-report-required",
+        RuntimeStopKind::SubmitReportRejected => "submit-report-rejected",
     }
 }
 
@@ -949,6 +1081,10 @@ mod tests {
         EvidenceId::parse("evidence/subagent-acceptance").expect("evidence id")
     }
 
+    fn cleanup_evidence_id() -> EvidenceId {
+        EvidenceId::parse("evidence/subagent-cleanup").expect("cleanup evidence id")
+    }
+
     fn artifact_id() -> ArtifactId {
         ArtifactId::parse("artifact/subagent-patch").expect("artifact id")
     }
@@ -1016,6 +1152,24 @@ mod tests {
             .expect("record passed evidence");
     }
 
+    fn record_passed_cleanup_evidence(ledger: &mut CoworkLedger) {
+        ledger
+            .apply_update(LedgerUpdate::RecordEvidence(Evidence {
+                id: cleanup_evidence_id(),
+                kind: EvidenceKind::Inspection,
+                summary: "Runtime cleanup completed after failed child work.".to_string(),
+                collected_at: Utc::now(),
+                collected_by: actor(),
+                result: EvidenceResult::Passed,
+                subjects: vec![EntityRef::Task(task_id())],
+                command: None,
+                source_refs: Vec::new(),
+                artifact_ids: Vec::new(),
+                metadata: runtime_metadata("cleanup"),
+            }))
+            .expect("record cleanup evidence");
+    }
+
     fn record_artifact(ledger: &mut CoworkLedger) {
         ledger
             .apply_update(LedgerUpdate::RecordArtifact(Artifact {
@@ -1045,6 +1199,14 @@ mod tests {
                 metadata: Metadata::new(),
             }))
             .expect("record blocker");
+    }
+
+    fn cleanup_evidence(ledger: &CoworkLedger) -> Vec<&Evidence> {
+        ledger
+            .evidence()
+            .values()
+            .filter(|evidence| is_cleanup_evidence(evidence))
+            .collect()
     }
 
     fn run_with(results: Vec<ObjectiveResponse>) -> (CoworkLedger, SyntheticRunReport) {
@@ -1104,6 +1266,7 @@ mod tests {
                 max_turns: 1,
                 budget_limit: 10,
                 max_repair_attempts: 3,
+                ..RuntimeOptions::default()
             },
             actor(),
         );
@@ -1127,6 +1290,7 @@ mod tests {
                 max_turns: 10,
                 budget_limit: 1,
                 max_repair_attempts: 3,
+                ..RuntimeOptions::default()
             },
             actor(),
         );
@@ -1151,6 +1315,7 @@ mod tests {
 
         assert_eq!(report.stop.kind, RuntimeStopKind::Cancelled);
         assert_eq!(report.tool_calls, 0);
+        assert_eq!(report.cleanup_records, 1);
         assert_eq!(
             ledger.tasks().get(&task_id()).unwrap().status,
             TaskStatus::Cancelled
@@ -1158,6 +1323,114 @@ mod tests {
         assert!(ledger.stop_reasons().values().any(|reason| {
             reason.kind == StopReasonKind::Cancelled
                 && reason.subjects == vec![EntityRef::Task(task_id())]
+        }));
+        let cleanup = cleanup_evidence(&ledger);
+        assert_eq!(cleanup.len(), 1);
+        assert_eq!(
+            cleanup[0].metadata.get("parentCancellationPropagated"),
+            Some(&serde_json::json!(true))
+        );
+        assert_eq!(
+            cleanup[0].metadata.get("cleanupStopKind"),
+            Some(&serde_json::json!("cancelled"))
+        );
+    }
+
+    #[test]
+    fn child_tool_failure_records_cleanup_evidence() {
+        let (ledger, report) = CoworkRuntime::new(
+            ledger_with_task(TaskStatus::NotStarted),
+            SequenceDriver::new(vec![ToolResult::failed("child tool failed").into()]),
+            RuntimeOptions {
+                max_repair_attempts: 0,
+                ..RuntimeOptions::default()
+            },
+            actor(),
+        )
+        .run()
+        .expect("runtime run");
+
+        assert_eq!(report.stop.kind, RuntimeStopKind::Failed);
+        assert_eq!(report.tool_calls, 1);
+        assert_eq!(report.cleanup_records, 1);
+        assert_eq!(report.final_task_status, Some(TaskStatus::Failed));
+        let task = ledger.tasks().get(&task_id()).unwrap();
+        assert_eq!(task.status, TaskStatus::Failed);
+        assert_eq!(report.evidence_records, 2);
+        assert_eq!(task.evidence_ids.len(), 2);
+        let cleanup = cleanup_evidence(&ledger);
+        assert_eq!(cleanup.len(), 1);
+        assert!(task.evidence_ids.contains(&cleanup[0].id));
+        assert_eq!(cleanup[0].result, EvidenceResult::Passed);
+        assert_eq!(
+            cleanup[0].metadata.get("cleanupStopKind"),
+            Some(&serde_json::json!("failed"))
+        );
+        assert!(ledger.evidence().values().any(|evidence| {
+            evidence.kind == EvidenceKind::FailedAttempt
+                && evidence.summary == "child tool failed"
+                && evidence.subjects == vec![EntityRef::Task(task_id())]
+        }));
+    }
+
+    #[test]
+    fn repeated_child_delegation_loop_guard_stops_before_tool_call() {
+        let mut metadata = Metadata::new();
+        metadata.insert("delegationRepeatCount".to_string(), serde_json::json!(2));
+        let (ledger, report) = CoworkRuntime::new(
+            ledger_with_task_metadata(TaskStatus::NotStarted, metadata),
+            SequenceDriver::new(vec![ToolResult::passed("should not run").into()]),
+            RuntimeOptions {
+                max_repeated_child_delegations: 1,
+                ..RuntimeOptions::default()
+            },
+            actor(),
+        )
+        .run()
+        .expect("runtime run");
+
+        assert_eq!(report.stop.kind, RuntimeStopKind::DelegationLoopGuard);
+        assert_eq!(report.tool_calls, 0);
+        assert_eq!(report.cleanup_records, 1);
+        assert_eq!(report.final_task_status, Some(TaskStatus::Failed));
+        assert_eq!(
+            ledger.tasks().get(&task_id()).unwrap().status,
+            TaskStatus::Failed
+        );
+        let cleanup = cleanup_evidence(&ledger);
+        assert_eq!(cleanup.len(), 1);
+        assert_eq!(
+            cleanup[0].metadata.get("cleanupStopKind"),
+            Some(&serde_json::json!("delegation_loop_guard"))
+        );
+        assert!(ledger.stop_reasons().values().any(|reason| {
+            reason.kind == StopReasonKind::Failed
+                && reason.summary.contains("Repeated child delegation count 2")
+        }));
+    }
+
+    #[test]
+    fn nested_delegation_depth_guard_stops_before_tool_call() {
+        let mut metadata = Metadata::new();
+        metadata.insert("delegationDepth".to_string(), serde_json::json!(5));
+        let (ledger, report) = CoworkRuntime::new(
+            ledger_with_task_metadata(TaskStatus::NotStarted, metadata),
+            SequenceDriver::new(vec![ToolResult::passed("should not run").into()]),
+            RuntimeOptions {
+                max_delegation_depth: 4,
+                ..RuntimeOptions::default()
+            },
+            actor(),
+        )
+        .run()
+        .expect("runtime run");
+
+        assert_eq!(report.stop.kind, RuntimeStopKind::DelegationLoopGuard);
+        assert_eq!(report.tool_calls, 0);
+        assert_eq!(report.cleanup_records, 1);
+        assert_eq!(report.final_task_status, Some(TaskStatus::Failed));
+        assert!(ledger.stop_reasons().values().any(|reason| {
+            reason.kind == StopReasonKind::Failed && reason.summary.contains("Delegation depth 5")
         }));
     }
 
@@ -1169,12 +1442,14 @@ mod tests {
             report.stop.kind,
             RuntimeStopKind::ModelMessageWithoutEvidence
         );
-        assert_eq!(report.evidence_records, 0);
+        assert_eq!(report.evidence_records, 1);
+        assert_eq!(report.cleanup_records, 1);
         assert_eq!(report.final_task_status, Some(TaskStatus::Failed));
         assert_ne!(
             ledger.tasks().get(&task_id()).unwrap().status,
             TaskStatus::Verified
         );
+        assert_eq!(cleanup_evidence(&ledger).len(), 1);
     }
 
     #[test]
@@ -1193,12 +1468,14 @@ mod tests {
         let (ledger, report) = runtime.run().expect("runtime run");
 
         assert_eq!(report.stop.kind, RuntimeStopKind::SubmitReportRequired);
-        assert_eq!(report.evidence_records, 0);
+        assert_eq!(report.evidence_records, 1);
+        assert_eq!(report.cleanup_records, 1);
         assert_eq!(report.final_task_status, Some(TaskStatus::Failed));
         assert_ne!(
             ledger.tasks().get(&task_id()).unwrap().status,
             TaskStatus::Verified
         );
+        assert_eq!(cleanup_evidence(&ledger).len(), 1);
     }
 
     #[test]
@@ -1266,12 +1543,14 @@ mod tests {
         let (ledger, report) = run_with(vec![report_result.into()]);
 
         assert_eq!(report.stop.kind, RuntimeStopKind::SubmitReportRejected);
-        assert_eq!(report.evidence_records, 0);
+        assert_eq!(report.evidence_records, 1);
+        assert_eq!(report.cleanup_records, 1);
         assert_eq!(report.final_task_status, Some(TaskStatus::Failed));
         assert_ne!(
             ledger.tasks().get(&task_id()).unwrap().status,
             TaskStatus::Verified
         );
+        assert_eq!(cleanup_evidence(&ledger).len(), 1);
         assert!(ledger
             .evidence()
             .values()
@@ -1296,6 +1575,39 @@ mod tests {
             ledger.tasks().get(&task_id()).unwrap().status,
             TaskStatus::Verified
         );
+    }
+
+    #[test]
+    fn verified_submit_report_cannot_use_cleanup_evidence_as_acceptance() {
+        let mut ledger = ledger_with_task(TaskStatus::NotStarted);
+        record_passed_cleanup_evidence(&mut ledger);
+        let report_result = SubmitReport::new(
+            SubmitReportStatus::Verified,
+            "Subagent cites cleanup as if it proved acceptance.",
+            vec![cleanup_evidence_id()],
+            Vec::new(),
+            Vec::new(),
+            87,
+        );
+        let (ledger, report) = CoworkRuntime::new(
+            ledger,
+            SequenceDriver::new(vec![report_result.into()]),
+            RuntimeOptions::default(),
+            actor(),
+        )
+        .run()
+        .expect("runtime run");
+
+        assert_eq!(report.stop.kind, RuntimeStopKind::SubmitReportRejected);
+        assert_eq!(report.final_task_status, Some(TaskStatus::Failed));
+        assert_ne!(
+            ledger.tasks().get(&task_id()).unwrap().status,
+            TaskStatus::Verified
+        );
+        assert!(ledger
+            .evidence()
+            .values()
+            .all(|evidence| evidence.kind != EvidenceKind::SubagentReport));
     }
 
     #[test]
