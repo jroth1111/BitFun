@@ -132,6 +132,7 @@ define_id!(BlockerId, "blocker id");
 define_id!(EvidenceId, "evidence id");
 define_id!(CheckpointId, "checkpoint id");
 define_id!(ArtifactId, "artifact id");
+define_id!(BrowserActionId, "browser action id");
 define_id!(SessionId, "session id");
 define_id!(StopReasonId, "stop reason id");
 define_id!(WaiverId, "waiver id");
@@ -206,6 +207,10 @@ pub enum RuntimeAuthority {
     CoworkLedger,
 }
 
+fn default_runtime_authority() -> RuntimeAuthority {
+    RuntimeAuthority::CoworkLedger
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExternalAuthority {
@@ -223,6 +228,8 @@ pub struct AuthorityInvariant {
     pub evidence_authority: RuntimeAuthority,
     pub checkpoint_authority: RuntimeAuthority,
     pub artifact_authority: RuntimeAuthority,
+    #[serde(default = "default_runtime_authority")]
+    pub browser_action_authority: RuntimeAuthority,
     pub session_authority: RuntimeAuthority,
     pub waiver_authority: RuntimeAuthority,
     pub provenance_authority: RuntimeAuthority,
@@ -240,6 +247,7 @@ impl AuthorityInvariant {
             evidence_authority: RuntimeAuthority::CoworkLedger,
             checkpoint_authority: RuntimeAuthority::CoworkLedger,
             artifact_authority: RuntimeAuthority::CoworkLedger,
+            browser_action_authority: RuntimeAuthority::CoworkLedger,
             session_authority: RuntimeAuthority::CoworkLedger,
             waiver_authority: RuntimeAuthority::CoworkLedger,
             provenance_authority: RuntimeAuthority::CoworkLedger,
@@ -496,6 +504,8 @@ pub struct CoworkLedger {
     evidence: BTreeMap<EvidenceId, Evidence>,
     checkpoints: BTreeMap<CheckpointId, Checkpoint>,
     artifacts: BTreeMap<ArtifactId, Artifact>,
+    #[serde(default)]
+    browser_actions: BTreeMap<BrowserActionId, BrowserAction>,
     sessions: BTreeMap<SessionId, SessionRecord>,
     stop_reasons: BTreeMap<StopReasonId, StopReasonRecord>,
     waivers: BTreeMap<WaiverId, Waiver>,
@@ -565,6 +575,7 @@ impl CoworkLedger {
             evidence: BTreeMap::new(),
             checkpoints: BTreeMap::new(),
             artifacts: BTreeMap::new(),
+            browser_actions: BTreeMap::new(),
             sessions: BTreeMap::new(),
             stop_reasons: BTreeMap::new(),
             waivers: BTreeMap::new(),
@@ -613,6 +624,10 @@ impl CoworkLedger {
         &self.artifacts
     }
 
+    pub fn browser_actions(&self) -> &BTreeMap<BrowserActionId, BrowserAction> {
+        &self.browser_actions
+    }
+
     pub fn sessions(&self) -> &BTreeMap<SessionId, SessionRecord> {
         &self.sessions
     }
@@ -627,6 +642,97 @@ impl CoworkLedger {
 
     pub fn provenance_links(&self) -> &BTreeMap<ProvenanceLinkId, ProvenanceLink> {
         &self.provenance_links
+    }
+
+    pub fn export_evidence_graph(&self) -> EvidenceGraph {
+        EvidenceGraph {
+            tasks: self
+                .tasks
+                .values()
+                .map(|task| TaskEvidenceNode {
+                    id: task.id.clone(),
+                    status: task.status,
+                    evidence_ids: self.evidence_ids_for_subject(&EntityRef::Task(task.id.clone())),
+                    artifact_ids: task.artifact_ids.clone(),
+                    browser_action_ids: self.browser_action_ids_for_task(&task.id),
+                    session_ids: self.session_ids_for_task(&task.id),
+                })
+                .collect(),
+            evidence: self
+                .evidence
+                .values()
+                .map(|evidence| EvidenceGraphNode {
+                    id: evidence.id.clone(),
+                    kind: evidence.kind,
+                    result: evidence.result,
+                    subjects: evidence.subjects.clone(),
+                    source_refs: evidence.source_refs.clone(),
+                    artifact_ids: evidence.artifact_ids.clone(),
+                })
+                .collect(),
+            artifacts: self
+                .artifacts
+                .values()
+                .map(|artifact| ArtifactEvidenceNode {
+                    id: artifact.id.clone(),
+                    kind: artifact.kind,
+                    produced_by: artifact.produced_by.clone(),
+                    evidence_ids: artifact.evidence_ids.clone(),
+                })
+                .collect(),
+            browser_actions: self
+                .browser_actions
+                .values()
+                .map(|action| BrowserActionEvidenceNode {
+                    id: action.id.clone(),
+                    kind: action.kind,
+                    status: action.status,
+                    session_id: action.session_id.clone(),
+                    task_ids: action.task_ids.clone(),
+                    evidence_ids: action.evidence_ids.clone(),
+                    artifact_ids: action.artifact_ids.clone(),
+                })
+                .collect(),
+            sessions: self
+                .sessions
+                .values()
+                .map(|session| SessionEvidenceNode {
+                    id: session.id.clone(),
+                    kind: session.kind,
+                    status: session.status,
+                    actor: session.actor.clone(),
+                    evidence_ids: self
+                        .evidence_ids_for_subject(&EntityRef::Session(session.id.clone())),
+                    artifact_ids: self
+                        .artifact_ids_produced_by(&EntityRef::Session(session.id.clone())),
+                })
+                .collect(),
+            provenance_links: self.provenance_links.values().cloned().collect(),
+        }
+    }
+
+    pub fn audit_evidence_graph(&self) -> EvidenceGraphAudit {
+        let orphan_evidence_ids = self
+            .evidence
+            .values()
+            .filter(|evidence| self.is_orphan_evidence(evidence))
+            .map(|evidence| evidence.id.clone())
+            .collect();
+
+        let false_completed_task_ids = self
+            .tasks
+            .values()
+            .filter(|task| {
+                task.status == TaskStatus::Verified
+                    && !self.task_has_passed_supporting_evidence(&task.id)
+            })
+            .map(|task| task.id.clone())
+            .collect();
+
+        EvidenceGraphAudit {
+            orphan_evidence_ids,
+            false_completed_task_ids,
+        }
     }
 
     pub fn apply_update(&mut self, update: LedgerUpdate) -> Result<ApplyReport, LedgerError> {
@@ -658,6 +764,10 @@ impl CoworkLedger {
             LedgerUpdate::RecordArtifact(artifact) => {
                 self.record_artifact(artifact)?;
                 Ok(ApplyReport::applied("record_artifact"))
+            }
+            LedgerUpdate::RecordBrowserAction(action) => {
+                self.record_browser_action(action)?;
+                Ok(ApplyReport::applied("record_browser_action"))
             }
             LedgerUpdate::RecordSession(session) => {
                 self.record_session(session)?;
@@ -724,6 +834,11 @@ impl CoworkLedger {
         for artifact in summary.artifacts {
             self.record_artifact(artifact)?;
             applied.effects.push("artifact".to_string());
+        }
+
+        for action in summary.browser_actions {
+            self.record_browser_action(action)?;
+            applied.effects.push("browser_action".to_string());
         }
 
         for checkpoint in summary.checkpoints {
@@ -939,6 +1054,17 @@ impl CoworkLedger {
             self.require_entity_exists(&EntityRef::Evidence(evidence.id.clone()), subject)?;
         }
 
+        for source_ref in &evidence.source_refs {
+            self.validate_evidence_source_ref(&evidence.id, source_ref)?;
+        }
+
+        for artifact_id in &evidence.artifact_ids {
+            self.require_entity_exists(
+                &EntityRef::Evidence(evidence.id.clone()),
+                &EntityRef::Artifact(artifact_id.clone()),
+            )?;
+        }
+
         if self.evidence.contains_key(&evidence.id) {
             return Err(LedgerError::DuplicateId {
                 entity: "evidence",
@@ -951,6 +1077,37 @@ impl CoworkLedger {
                 if let Some(task) = self.tasks.get_mut(task_id) {
                     push_unique(&mut task.evidence_ids, evidence.id.clone());
                 }
+            }
+        }
+
+        for source_ref in &evidence.source_refs {
+            match source_ref {
+                EvidenceSourceRef::GeneratedArtifact { artifact_id }
+                | EvidenceSourceRef::Artifact { artifact_id } => {
+                    if let Some(artifact) = self.artifacts.get_mut(artifact_id) {
+                        push_unique(&mut artifact.evidence_ids, evidence.id.clone());
+                    }
+                }
+                EvidenceSourceRef::BrowserAction { browser_action_id } => {
+                    if let Some(action) = self.browser_actions.get_mut(browser_action_id) {
+                        push_unique(&mut action.evidence_ids, evidence.id.clone());
+                    }
+                }
+                EvidenceSourceRef::Waiver { waiver_id } => {
+                    if let Some(waiver) = self.waivers.get_mut(waiver_id) {
+                        waiver.evidence_id = Some(evidence.id.clone());
+                    }
+                }
+                EvidenceSourceRef::Command { .. }
+                | EvidenceSourceRef::File { .. }
+                | EvidenceSourceRef::Citation { .. }
+                | EvidenceSourceRef::FailedAttempt { .. } => {}
+            }
+        }
+
+        for artifact_id in &evidence.artifact_ids {
+            if let Some(artifact) = self.artifacts.get_mut(artifact_id) {
+                push_unique(&mut artifact.evidence_ids, evidence.id.clone());
             }
         }
 
@@ -1014,6 +1171,56 @@ impl CoworkLedger {
         }
 
         self.artifacts.insert(artifact.id.clone(), artifact);
+        Ok(())
+    }
+
+    fn record_browser_action(&mut self, action: BrowserAction) -> Result<(), LedgerError> {
+        require_text("browserAction.target", &action.target)?;
+        self.require_entity_exists(
+            &EntityRef::BrowserAction(action.id.clone()),
+            &EntityRef::Session(action.session_id.clone()),
+        )?;
+
+        for task_id in &action.task_ids {
+            self.require_entity_exists(
+                &EntityRef::BrowserAction(action.id.clone()),
+                &EntityRef::Task(task_id.clone()),
+            )?;
+        }
+
+        for evidence_id in &action.evidence_ids {
+            self.require_entity_exists(
+                &EntityRef::BrowserAction(action.id.clone()),
+                &EntityRef::Evidence(evidence_id.clone()),
+            )?;
+        }
+
+        for artifact_id in &action.artifact_ids {
+            self.require_entity_exists(
+                &EntityRef::BrowserAction(action.id.clone()),
+                &EntityRef::Artifact(artifact_id.clone()),
+            )?;
+        }
+
+        if self.browser_actions.contains_key(&action.id) {
+            return Err(LedgerError::DuplicateId {
+                entity: "browser action",
+                id: action.id.to_string(),
+            });
+        }
+
+        for task_id in &action.task_ids {
+            if let Some(task) = self.tasks.get_mut(task_id) {
+                for evidence_id in &action.evidence_ids {
+                    push_unique(&mut task.evidence_ids, evidence_id.clone());
+                }
+                for artifact_id in &action.artifact_ids {
+                    push_unique(&mut task.artifact_ids, artifact_id.clone());
+                }
+            }
+        }
+
+        self.browser_actions.insert(action.id.clone(), action);
         Ok(())
     }
 
@@ -1111,11 +1318,167 @@ impl CoworkLedger {
             EntityRef::Evidence(id) => self.evidence.contains_key(id),
             EntityRef::Checkpoint(id) => self.checkpoints.contains_key(id),
             EntityRef::Artifact(id) => self.artifacts.contains_key(id),
+            EntityRef::BrowserAction(id) => self.browser_actions.contains_key(id),
             EntityRef::Session(id) => self.sessions.contains_key(id),
             EntityRef::StopReason(id) => self.stop_reasons.contains_key(id),
             EntityRef::Waiver(id) => self.waivers.contains_key(id),
             EntityRef::ProvenanceLink(id) => self.provenance_links.contains_key(id),
         }
+    }
+
+    fn validate_evidence_source_ref(
+        &self,
+        evidence_id: &EvidenceId,
+        source_ref: &EvidenceSourceRef,
+    ) -> Result<(), LedgerError> {
+        let from = EntityRef::Evidence(evidence_id.clone());
+        match source_ref {
+            EvidenceSourceRef::GeneratedArtifact { artifact_id }
+            | EvidenceSourceRef::Artifact { artifact_id } => {
+                self.require_entity_exists(&from, &EntityRef::Artifact(artifact_id.clone()))
+            }
+            EvidenceSourceRef::BrowserAction { browser_action_id } => self
+                .require_entity_exists(&from, &EntityRef::BrowserAction(browser_action_id.clone())),
+            EvidenceSourceRef::Waiver { waiver_id } => {
+                self.require_entity_exists(&from, &EntityRef::Waiver(waiver_id.clone()))
+            }
+            EvidenceSourceRef::Command { command }
+            | EvidenceSourceRef::File { path: command }
+            | EvidenceSourceRef::Citation {
+                uri: command,
+                title: _,
+            }
+            | EvidenceSourceRef::FailedAttempt { action: command } => {
+                require_text("evidence.sourceRef", command)
+            }
+        }
+    }
+
+    fn evidence_ids_for_subject(&self, subject: &EntityRef) -> Vec<EvidenceId> {
+        let mut evidence_ids = Vec::new();
+
+        for evidence in self.evidence.values() {
+            if evidence
+                .subjects
+                .iter()
+                .any(|evidence_subject| evidence_subject == subject)
+            {
+                push_unique(&mut evidence_ids, evidence.id.clone());
+            }
+        }
+
+        for link in self.provenance_links.values() {
+            if link.kind == ProvenanceLinkKind::Supports && &link.to == subject {
+                if let EntityRef::Evidence(evidence_id) = &link.from {
+                    push_unique(&mut evidence_ids, evidence_id.clone());
+                }
+            }
+        }
+
+        match subject {
+            EntityRef::Task(task_id) => {
+                if let Some(task) = self.tasks.get(task_id) {
+                    for evidence_id in &task.evidence_ids {
+                        push_unique(&mut evidence_ids, evidence_id.clone());
+                    }
+                }
+            }
+            EntityRef::Artifact(artifact_id) => {
+                if let Some(artifact) = self.artifacts.get(artifact_id) {
+                    for evidence_id in &artifact.evidence_ids {
+                        push_unique(&mut evidence_ids, evidence_id.clone());
+                    }
+                }
+            }
+            EntityRef::BrowserAction(browser_action_id) => {
+                if let Some(action) = self.browser_actions.get(browser_action_id) {
+                    for evidence_id in &action.evidence_ids {
+                        push_unique(&mut evidence_ids, evidence_id.clone());
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        evidence_ids
+    }
+
+    fn artifact_ids_produced_by(&self, producer: &EntityRef) -> Vec<ArtifactId> {
+        self.artifacts
+            .values()
+            .filter(|artifact| &artifact.produced_by == producer)
+            .map(|artifact| artifact.id.clone())
+            .collect()
+    }
+
+    fn browser_action_ids_for_task(&self, task_id: &TaskId) -> Vec<BrowserActionId> {
+        self.browser_actions
+            .values()
+            .filter(|action| action.task_ids.contains(task_id))
+            .map(|action| action.id.clone())
+            .collect()
+    }
+
+    fn session_ids_for_task(&self, task_id: &TaskId) -> Vec<SessionId> {
+        let mut session_ids = Vec::new();
+        for action in self.browser_actions.values() {
+            if action.task_ids.contains(task_id) {
+                push_unique(&mut session_ids, action.session_id.clone());
+            }
+        }
+        session_ids
+    }
+
+    fn is_orphan_evidence(&self, evidence: &Evidence) -> bool {
+        let evidence_ref = EntityRef::Evidence(evidence.id.clone());
+
+        if !evidence.subjects.is_empty() || !evidence.artifact_ids.is_empty() {
+            return false;
+        }
+
+        if self
+            .tasks
+            .values()
+            .any(|task| task.evidence_ids.contains(&evidence.id))
+            || self
+                .blockers
+                .values()
+                .any(|blocker| blocker.evidence_ids.contains(&evidence.id))
+            || self
+                .checkpoints
+                .values()
+                .any(|checkpoint| checkpoint.evidence_ids.contains(&evidence.id))
+            || self
+                .artifacts
+                .values()
+                .any(|artifact| artifact.evidence_ids.contains(&evidence.id))
+            || self
+                .browser_actions
+                .values()
+                .any(|action| action.evidence_ids.contains(&evidence.id))
+            || self
+                .waivers
+                .values()
+                .any(|waiver| waiver.evidence_id.as_ref() == Some(&evidence.id))
+            || self
+                .provenance_links
+                .values()
+                .any(|link| link.from == evidence_ref || link.to == evidence_ref)
+        {
+            return false;
+        }
+
+        true
+    }
+
+    fn task_has_passed_supporting_evidence(&self, task_id: &TaskId) -> bool {
+        self.evidence_ids_for_subject(&EntityRef::Task(task_id.clone()))
+            .iter()
+            .any(|evidence_id| {
+                self.evidence
+                    .get(evidence_id)
+                    .is_some_and(|evidence| evidence.result == EvidenceResult::Passed)
+            })
     }
 }
 
@@ -1148,6 +1511,7 @@ pub enum LedgerUpdate {
     RecordEvidence(Evidence),
     RecordCheckpoint(Checkpoint),
     RecordArtifact(Artifact),
+    RecordBrowserAction(BrowserAction),
     RecordSession(SessionRecord),
     RecordStopReason(StopReasonRecord),
     RecordWaiver(Waiver),
@@ -1179,6 +1543,8 @@ pub struct CompactionSummaryUpdate {
     pub checkpoints: Vec<Checkpoint>,
     #[serde(default)]
     pub artifacts: Vec<Artifact>,
+    #[serde(default)]
+    pub browser_actions: Vec<BrowserAction>,
     #[serde(default)]
     pub stop_reasons: Vec<StopReasonRecord>,
     #[serde(default)]
@@ -1340,6 +1706,8 @@ pub struct Evidence {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command: Option<CommandEvidence>,
     #[serde(default)]
+    pub source_refs: Vec<EvidenceSourceRef>,
+    #[serde(default)]
     pub artifact_ids: Vec<ArtifactId>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub metadata: Metadata,
@@ -1355,6 +1723,12 @@ pub enum EvidenceKind {
     ArtifactValidation,
     UserInput,
     SubagentReport,
+    File,
+    Citation,
+    BrowserAction,
+    GeneratedArtifact,
+    FailedAttempt,
+    Waiver,
     CompactionSummary,
 }
 
@@ -1380,6 +1754,37 @@ pub struct CommandEvidence {
     pub stderr_excerpt: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub environment: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum EvidenceSourceRef {
+    Command {
+        command: String,
+    },
+    File {
+        path: String,
+    },
+    Citation {
+        uri: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+    },
+    BrowserAction {
+        browser_action_id: BrowserActionId,
+    },
+    GeneratedArtifact {
+        artifact_id: ArtifactId,
+    },
+    Artifact {
+        artifact_id: ArtifactId,
+    },
+    FailedAttempt {
+        action: String,
+    },
+    Waiver {
+        waiver_id: WaiverId,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1436,6 +1841,50 @@ pub enum ArtifactKind {
     Json,
     Log,
     Other,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserAction {
+    pub id: BrowserActionId,
+    pub kind: BrowserActionKind,
+    pub status: BrowserActionStatus,
+    pub session_id: SessionId,
+    #[serde(default)]
+    pub task_ids: Vec<TaskId>,
+    pub target: String,
+    pub performed_at: DateTime<Utc>,
+    pub performed_by: ActorRef,
+    #[serde(default)]
+    pub evidence_ids: Vec<EvidenceId>,
+    #[serde(default)]
+    pub artifact_ids: Vec<ArtifactId>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: Metadata,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserActionKind {
+    Navigate,
+    Click,
+    Type,
+    Submit,
+    Observe,
+    Screenshot,
+    Download,
+    Upload,
+    Script,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserActionStatus {
+    Succeeded,
+    Failed,
+    Blocked,
+    Waived,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1562,10 +2011,89 @@ pub enum EntityRef {
     Evidence(EvidenceId),
     Checkpoint(CheckpointId),
     Artifact(ArtifactId),
+    BrowserAction(BrowserActionId),
     Session(SessionId),
     StopReason(StopReasonId),
     Waiver(WaiverId),
     ProvenanceLink(ProvenanceLinkId),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EvidenceGraph {
+    pub tasks: Vec<TaskEvidenceNode>,
+    pub evidence: Vec<EvidenceGraphNode>,
+    pub artifacts: Vec<ArtifactEvidenceNode>,
+    pub browser_actions: Vec<BrowserActionEvidenceNode>,
+    pub sessions: Vec<SessionEvidenceNode>,
+    pub provenance_links: Vec<ProvenanceLink>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskEvidenceNode {
+    pub id: TaskId,
+    pub status: TaskStatus,
+    pub evidence_ids: Vec<EvidenceId>,
+    pub artifact_ids: Vec<ArtifactId>,
+    pub browser_action_ids: Vec<BrowserActionId>,
+    pub session_ids: Vec<SessionId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EvidenceGraphNode {
+    pub id: EvidenceId,
+    pub kind: EvidenceKind,
+    pub result: EvidenceResult,
+    pub subjects: Vec<EntityRef>,
+    pub source_refs: Vec<EvidenceSourceRef>,
+    pub artifact_ids: Vec<ArtifactId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArtifactEvidenceNode {
+    pub id: ArtifactId,
+    pub kind: ArtifactKind,
+    pub produced_by: EntityRef,
+    pub evidence_ids: Vec<EvidenceId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserActionEvidenceNode {
+    pub id: BrowserActionId,
+    pub kind: BrowserActionKind,
+    pub status: BrowserActionStatus,
+    pub session_id: SessionId,
+    pub task_ids: Vec<TaskId>,
+    pub evidence_ids: Vec<EvidenceId>,
+    pub artifact_ids: Vec<ArtifactId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionEvidenceNode {
+    pub id: SessionId,
+    pub kind: SessionKind,
+    pub status: SessionStatus,
+    pub actor: ActorRef,
+    pub evidence_ids: Vec<EvidenceId>,
+    pub artifact_ids: Vec<ArtifactId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EvidenceGraphAudit {
+    pub orphan_evidence_ids: Vec<EvidenceId>,
+    pub false_completed_task_ids: Vec<TaskId>,
+}
+
+impl EvidenceGraphAudit {
+    pub fn is_clean(&self) -> bool {
+        self.orphan_evidence_ids.is_empty() && self.false_completed_task_ids.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1769,6 +2297,7 @@ mod tests {
         assert_id_roundtrip!(EvidenceId, "evidence/1");
         assert_id_roundtrip!(CheckpointId, "checkpoint/1");
         assert_id_roundtrip!(ArtifactId, "artifact/1");
+        assert_id_roundtrip!(BrowserActionId, "browser-action/1");
         assert_id_roundtrip!(SessionId, "session/1");
         assert_id_roundtrip!(StopReasonId, "stop/1");
         assert_id_roundtrip!(WaiverId, "waiver/1");
@@ -1999,6 +2528,10 @@ mod tests {
             ledger.tasks().get(&task_id()).expect("task exists").status,
             TaskStatus::Verified
         );
+        assert_eq!(
+            ledger.audit_evidence_graph().false_completed_task_ids,
+            vec![task_id()]
+        );
     }
 
     #[test]
@@ -2019,6 +2552,164 @@ mod tests {
         assert!(matches!(error, LedgerError::UnknownReference { .. }));
     }
 
+    #[test]
+    fn sample_run_exports_linked_task_evidence_artifact_browser_and_session_graph() {
+        let mut ledger = fixture_ledger_with_task();
+        record_session_artifact_and_browser_action(&mut ledger);
+        ledger
+            .apply_update(LedgerUpdate::RecordWaiver(Waiver {
+                id: waiver_id(),
+                waived_entity: EntityRef::Task(task_id()),
+                reason: "Manual browser evidence is accepted for the sample run.".to_string(),
+                granted_by: worker(),
+                granted_at: timestamp(10),
+                expires_at: None,
+                evidence_id: None,
+                metadata: Metadata::new(),
+            }))
+            .expect("record waiver before evidence links to it");
+
+        ledger
+            .apply_update(LedgerUpdate::RecordEvidence(Evidence {
+                id: evidence_id(),
+                kind: EvidenceKind::BrowserAction,
+                summary: "Browser action generated artifact and verified task behavior."
+                    .to_string(),
+                collected_at: timestamp(11),
+                collected_by: worker(),
+                result: EvidenceResult::Passed,
+                subjects: vec![
+                    EntityRef::Task(task_id()),
+                    EntityRef::BrowserAction(browser_action_id()),
+                    EntityRef::Session(session_id()),
+                ],
+                command: Some(CommandEvidence {
+                    command_line: "cargo test -p cowork-ledger".to_string(),
+                    cwd: "/workspace".to_string(),
+                    exit_code: 0,
+                    started_at: timestamp(11),
+                    stdout_excerpt: Some("test result: ok".to_string()),
+                    stderr_excerpt: None,
+                    environment: BTreeMap::new(),
+                }),
+                source_refs: vec![
+                    EvidenceSourceRef::Command {
+                        command: "cargo test -p cowork-ledger".to_string(),
+                    },
+                    EvidenceSourceRef::BrowserAction {
+                        browser_action_id: browser_action_id(),
+                    },
+                    EvidenceSourceRef::GeneratedArtifact {
+                        artifact_id: artifact_id(),
+                    },
+                    EvidenceSourceRef::File {
+                        path: "probe-output/evidence-graph.json".to_string(),
+                    },
+                    EvidenceSourceRef::Citation {
+                        uri: "https://example.invalid/spec".to_string(),
+                        title: Some("Acceptance citation".to_string()),
+                    },
+                    EvidenceSourceRef::Waiver {
+                        waiver_id: waiver_id(),
+                    },
+                ],
+                artifact_ids: vec![artifact_id()],
+                metadata: Metadata::new(),
+            }))
+            .expect("record linked browser evidence");
+        ledger
+            .apply_update(LedgerUpdate::RecordStopReason(verified_stop_reason()))
+            .expect("record verified stop reason");
+        ledger
+            .apply_update(LedgerUpdate::UpdateTaskStatus(TaskStatusUpdate {
+                task_id: task_id(),
+                status: TaskStatus::Verified,
+                updated_at: timestamp(12),
+                updated_by: worker(),
+                evidence_ids: vec![evidence_id()],
+                blocker_ids: Vec::new(),
+                stop_reason_id: Some(verified_stop_reason_id()),
+                metadata: Metadata::new(),
+            }))
+            .expect("verify task with passed evidence");
+
+        let graph = ledger.export_evidence_graph();
+        let task_node = graph.tasks.first().expect("task graph node exists");
+        assert_eq!(task_node.evidence_ids, vec![evidence_id()]);
+        assert_eq!(task_node.artifact_ids, vec![artifact_id()]);
+        assert_eq!(task_node.browser_action_ids, vec![browser_action_id()]);
+        assert_eq!(task_node.session_ids, vec![session_id()]);
+
+        assert_eq!(graph.artifacts[0].evidence_ids, vec![evidence_id()]);
+        assert_eq!(graph.browser_actions[0].evidence_ids, vec![evidence_id()]);
+        assert_eq!(graph.sessions[0].evidence_ids, vec![evidence_id()]);
+        assert_eq!(
+            ledger
+                .waivers()
+                .get(&waiver_id())
+                .expect("waiver exists")
+                .evidence_id,
+            Some(evidence_id())
+        );
+
+        let exported = serde_json::to_value(&graph).expect("export evidence graph");
+        assert_eq!(
+            exported["tasks"][0]["evidenceIds"][0],
+            "evidence/compaction"
+        );
+        assert!(ledger.audit_evidence_graph().is_clean());
+    }
+
+    #[test]
+    fn evidence_graph_audit_detects_orphan_evidence_and_false_completion() {
+        let mut ledger = fixture_ledger_with_task();
+        ledger
+            .apply_update(LedgerUpdate::RecordEvidence(Evidence {
+                id: evidence_id(),
+                kind: EvidenceKind::FailedAttempt,
+                summary: "Command failed before it was attached to a task or action.".to_string(),
+                collected_at: timestamp(8),
+                collected_by: worker(),
+                result: EvidenceResult::Failed,
+                subjects: Vec::new(),
+                command: Some(CommandEvidence {
+                    command_line: "cargo test -p cowork-ledger".to_string(),
+                    cwd: "/workspace".to_string(),
+                    exit_code: 101,
+                    started_at: timestamp(8),
+                    stdout_excerpt: None,
+                    stderr_excerpt: Some("test failed".to_string()),
+                    environment: BTreeMap::new(),
+                }),
+                source_refs: vec![EvidenceSourceRef::FailedAttempt {
+                    action: "cargo test -p cowork-ledger".to_string(),
+                }],
+                artifact_ids: Vec::new(),
+                metadata: Metadata::new(),
+            }))
+            .expect("record orphan failed-attempt evidence");
+        ledger
+            .apply_update(LedgerUpdate::RecordStopReason(verified_stop_reason()))
+            .expect("record verified stop reason");
+        ledger
+            .apply_update(LedgerUpdate::UpdateTaskStatus(TaskStatusUpdate {
+                task_id: task_id(),
+                status: TaskStatus::Verified,
+                updated_at: timestamp(13),
+                updated_by: worker(),
+                evidence_ids: Vec::new(),
+                blocker_ids: Vec::new(),
+                stop_reason_id: Some(verified_stop_reason_id()),
+                metadata: Metadata::new(),
+            }))
+            .expect("verified status remains representable for audit");
+
+        let audit = ledger.audit_evidence_graph();
+        assert_eq!(audit.orphan_evidence_ids, vec![evidence_id()]);
+        assert_eq!(audit.false_completed_task_ids, vec![task_id()]);
+        assert!(!audit.is_clean());
+    }
+
     fn record_blocked_transition_inputs(ledger: &mut CoworkLedger) {
         ledger
             .apply_update(LedgerUpdate::RecordEvidence(Evidence {
@@ -2030,6 +2721,7 @@ mod tests {
                 result: EvidenceResult::Blocked,
                 subjects: vec![EntityRef::Task(task_id())],
                 command: None,
+                source_refs: Vec::new(),
                 artifact_ids: Vec::new(),
                 metadata: Metadata::new(),
             }))
@@ -2095,6 +2787,50 @@ mod tests {
         ledger
     }
 
+    fn record_session_artifact_and_browser_action(ledger: &mut CoworkLedger) {
+        ledger
+            .apply_update(LedgerUpdate::RecordSession(SessionRecord {
+                id: session_id(),
+                objective_id: objective_id(),
+                kind: SessionKind::Subagent,
+                status: SessionStatus::Completed,
+                started_at: timestamp(2),
+                ended_at: Some(timestamp(10)),
+                actor: worker(),
+                checkpoint_ids: Vec::new(),
+                stop_reason_id: None,
+                metadata: Metadata::new(),
+            }))
+            .expect("record session");
+        ledger
+            .apply_update(LedgerUpdate::RecordArtifact(Artifact {
+                id: artifact_id(),
+                kind: ArtifactKind::Json,
+                title: "Evidence graph export".to_string(),
+                uri: Some("probe-output/evidence-graph.json".to_string()),
+                content_hash: None,
+                produced_by: EntityRef::Session(session_id()),
+                evidence_ids: Vec::new(),
+                metadata: Metadata::new(),
+            }))
+            .expect("record artifact");
+        ledger
+            .apply_update(LedgerUpdate::RecordBrowserAction(BrowserAction {
+                id: browser_action_id(),
+                kind: BrowserActionKind::Observe,
+                status: BrowserActionStatus::Succeeded,
+                session_id: session_id(),
+                task_ids: vec![task_id()],
+                target: "https://example.invalid/app".to_string(),
+                performed_at: timestamp(10),
+                performed_by: worker(),
+                evidence_ids: Vec::new(),
+                artifact_ids: vec![artifact_id()],
+                metadata: Metadata::new(),
+            }))
+            .expect("record browser action");
+    }
+
     fn allowed_summary_update(observed_root: RootScopeObservation) -> CompactionSummaryUpdate {
         CompactionSummaryUpdate {
             observed_root,
@@ -2125,6 +2861,7 @@ mod tests {
                 result: EvidenceResult::Passed,
                 subjects: vec![EntityRef::Task(task_id())],
                 command: None,
+                source_refs: Vec::new(),
                 artifact_ids: Vec::new(),
                 metadata: Metadata::new(),
             }],
@@ -2143,6 +2880,7 @@ mod tests {
                 metadata: Metadata::new(),
             }],
             artifacts: Vec::new(),
+            browser_actions: Vec::new(),
             stop_reasons: vec![verified_stop_reason()],
             waivers: Vec::new(),
             provenance_links: vec![ProvenanceLink {
@@ -2198,6 +2936,18 @@ mod tests {
 
     fn evidence_id() -> EvidenceId {
         EvidenceId::parse("evidence/compaction").unwrap()
+    }
+
+    fn artifact_id() -> ArtifactId {
+        ArtifactId::parse("artifact/evidence-graph").unwrap()
+    }
+
+    fn browser_action_id() -> BrowserActionId {
+        BrowserActionId::parse("browser-action/observe").unwrap()
+    }
+
+    fn waiver_id() -> WaiverId {
+        WaiverId::parse("waiver/manual-browser-evidence").unwrap()
     }
 
     fn blocker_id() -> BlockerId {
