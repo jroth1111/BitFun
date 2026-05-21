@@ -1,0 +1,16 @@
+[package]
+name = "cowork-context"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+description = "Daemon-owned Cowork context fallback payloads and compaction contracts"
+
+[lib]
+name = "cowork_context"
+crate-type = ["rlib"]
+
+[dependencies]
+cowork-ledger = { path = "../cowork-ledger" }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

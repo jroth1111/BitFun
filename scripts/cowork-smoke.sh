@@ -132,6 +132,8 @@ run_step "format cowork-ledger" \
   cargo fmt -p cowork-ledger --check
 run_step "format cowork-runtime" \
   cargo fmt -p cowork-runtime --check
+run_step "format cowork-context" \
+  cargo fmt -p cowork-context --check
 run_step "format cowork-governance" \
   cargo fmt -p cowork-governance --check
 run_step "format cowork-protocol" \
@@ -146,6 +148,8 @@ run_step "test cowork-ledger" \
   cargo test -p cowork-ledger
 run_step "test cowork-runtime" \
   cargo test -p cowork-runtime
+run_step "test cowork-context" \
+  cargo test -p cowork-context
 run_step "test cowork-governance" \
   cargo test -p cowork-governance
 run_step "test cowork-protocol" \
@@ -157,7 +161,7 @@ run_step "test cowork-workspace" \
 run_step "test bitfun-cli cowork_daemon" \
   cargo test -p bitfun-cli cowork_daemon
 run_step "check selected Cowork crates" \
-  cargo check -p cowork-ledger -p cowork-runtime -p cowork-governance -p cowork-protocol -p cowork-plugin-registry -p cowork-workspace -p bitfun-cli
+  cargo check -p cowork-ledger -p cowork-runtime -p cowork-context -p cowork-governance -p cowork-protocol -p cowork-plugin-registry -p cowork-workspace -p bitfun-cli
 run_step "daemon help" \
   cargo run -q -p bitfun-cli -- daemon --help
 run_step "daemon start" \

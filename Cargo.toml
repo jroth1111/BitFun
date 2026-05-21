@@ -11,6 +11,7 @@ members = [
     "src/crates/cowork-governance",
     "src/crates/cowork-ledger",
     "src/crates/cowork-runtime",
+    "src/crates/cowork-context",
     "src/crates/cowork-protocol",
     "src/crates/cowork-plugin-registry",
     "src/crates/cowork-workspace",
