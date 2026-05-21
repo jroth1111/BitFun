@@ -150,6 +150,8 @@ run_step "test cowork-runtime" \
   cargo test -p cowork-runtime
 run_step "test cowork-runtime subagent failure suite" \
   cargo test -p cowork-runtime subagent_failure_suite
+run_step "test cowork-runtime plan repair suite" \
+  cargo test -p cowork-runtime plan_repair_suite
 run_step "test cowork-context" \
   cargo test -p cowork-context
 run_step "test cowork-governance" \

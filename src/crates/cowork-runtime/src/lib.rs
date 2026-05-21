@@ -10,7 +10,7 @@ use cowork_ledger::{
     StopReasonId, StopReasonKind, StopReasonRecord, Task, TaskId, TaskStatus, TaskStatusUpdate,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use thiserror::Error;
 
@@ -27,6 +27,8 @@ pub enum RuntimeStopKind {
     BudgetExceeded,
     Failed,
     ModelMessageWithoutEvidence,
+    PlanRepairRejected,
+    RepairLoopExhausted,
     SubmitReportRequired,
     SubmitReportRejected,
 }
@@ -123,6 +125,8 @@ impl ToolResult {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ObjectiveResponse {
     ToolResult(ToolResult),
+    PlanRepair(PlanRepair),
+    PlanRepairJson(String),
     SubmitReport(SubmitReport),
 }
 
@@ -135,6 +139,128 @@ impl From<ToolResult> for ObjectiveResponse {
 impl From<SubmitReport> for ObjectiveResponse {
     fn from(report: SubmitReport) -> Self {
         Self::SubmitReport(report)
+    }
+}
+
+impl From<PlanRepair> for ObjectiveResponse {
+    fn from(repair: PlanRepair) -> Self {
+        Self::PlanRepair(repair)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanRepair {
+    pub summary: String,
+    #[serde(default)]
+    pub tasks: Vec<PlanRepairTask>,
+}
+
+impl PlanRepair {
+    pub fn from_json(input: &str) -> Result<Self, PlanRepairRejection> {
+        serde_json::from_str(input).map_err(|error| PlanRepairRejection::MalformedJson {
+            message: error.to_string(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanRepairTask {
+    pub task_id: TaskId,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub dependencies: Vec<TaskId>,
+    #[serde(default)]
+    pub prior_evidence_ids: Vec<EvidenceId>,
+    pub rationale: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanRepairRejection {
+    MalformedJson {
+        message: String,
+    },
+    EmptySummary,
+    EmptyTasks,
+    EmptyTaskTitle(TaskId),
+    EmptyTaskRationale(TaskId),
+    DuplicateTaskId(TaskId),
+    ExistingTaskRewrite(TaskId),
+    UnknownDependency {
+        task_id: TaskId,
+        dependency_id: TaskId,
+    },
+    MissingFailedTaskDependency {
+        task_id: TaskId,
+        failed_task_id: TaskId,
+    },
+    UnknownPriorEvidence {
+        task_id: TaskId,
+        evidence_id: EvidenceId,
+    },
+    MissingFailedAttempt(TaskId),
+}
+
+impl fmt::Display for PlanRepairRejection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MalformedJson { message } => {
+                write!(formatter, "plan repair JSON is malformed: {message}")
+            }
+            Self::EmptySummary => formatter.write_str("PlanRepair summary is empty"),
+            Self::EmptyTasks => formatter.write_str("PlanRepair contains no downstream tasks"),
+            Self::EmptyTaskTitle(task_id) => {
+                write!(formatter, "PlanRepair task '{task_id}' has an empty title")
+            }
+            Self::EmptyTaskRationale(task_id) => {
+                write!(
+                    formatter,
+                    "PlanRepair task '{task_id}' has an empty rationale"
+                )
+            }
+            Self::DuplicateTaskId(task_id) => {
+                write!(
+                    formatter,
+                    "PlanRepair includes duplicate task id '{task_id}'"
+                )
+            }
+            Self::ExistingTaskRewrite(task_id) => {
+                write!(
+                    formatter,
+                    "PlanRepair attempts to rewrite existing task '{task_id}'"
+                )
+            }
+            Self::UnknownDependency {
+                task_id,
+                dependency_id,
+            } => write!(
+                formatter,
+                "PlanRepair task '{task_id}' references unknown dependency '{dependency_id}'"
+            ),
+            Self::MissingFailedTaskDependency {
+                task_id,
+                failed_task_id,
+            } => write!(
+                formatter,
+                "PlanRepair task '{task_id}' does not depend on failed task '{failed_task_id}'"
+            ),
+            Self::UnknownPriorEvidence {
+                task_id,
+                evidence_id,
+            } => write!(
+                formatter,
+                "PlanRepair task '{task_id}' references unknown prior evidence '{evidence_id}'"
+            ),
+            Self::MissingFailedAttempt(task_id) => {
+                write!(
+                    formatter,
+                    "PlanRepair for task '{task_id}' has no failed attempt"
+                )
+            }
+        }
     }
 }
 
@@ -293,7 +419,14 @@ pub struct CoworkRuntime<D> {
     repaired_after_failure: bool,
     selected_task_id: Option<TaskId>,
     attempts: BTreeMap<TaskId, u32>,
+    pending_repair: Option<PendingRepair>,
     cancel_requested: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingRepair {
+    task_id: TaskId,
+    failed_evidence_id: EvidenceId,
 }
 
 impl<D> CoworkRuntime<D>
@@ -311,6 +444,7 @@ where
             repaired_after_failure: false,
             selected_task_id: None,
             attempts: BTreeMap::new(),
+            pending_repair: None,
             cancel_requested: false,
         }
     }
@@ -410,6 +544,52 @@ where
             };
             let response = self.driver.execute(&request, &task);
             let result = match response {
+                ObjectiveResponse::PlanRepairJson(plan_json) => {
+                    let plan = match PlanRepair::from_json(&plan_json) {
+                        Ok(plan) => plan,
+                        Err(rejection) => {
+                            let summary = format!("PlanRepair rejected: {rejection}.");
+                            let stop = self.stop_task(
+                                &task.id,
+                                RuntimeStopKind::PlanRepairRejected,
+                                TaskStatus::Failed,
+                                StopReasonKind::Failed,
+                                &summary,
+                            )?;
+                            return Ok(self.finish(stop));
+                        }
+                    };
+                    return match self.accept_plan_repair(&task, plan)? {
+                        Ok(()) => continue,
+                        Err(rejection) => {
+                            let summary = format!("PlanRepair rejected: {rejection}.");
+                            let stop = self.stop_task(
+                                &task.id,
+                                RuntimeStopKind::PlanRepairRejected,
+                                TaskStatus::Failed,
+                                StopReasonKind::Failed,
+                                &summary,
+                            )?;
+                            Ok(self.finish(stop))
+                        }
+                    };
+                }
+                ObjectiveResponse::PlanRepair(plan) => {
+                    return match self.accept_plan_repair(&task, plan)? {
+                        Ok(()) => continue,
+                        Err(rejection) => {
+                            let summary = format!("PlanRepair rejected: {rejection}.");
+                            let stop = self.stop_task(
+                                &task.id,
+                                RuntimeStopKind::PlanRepairRejected,
+                                TaskStatus::Failed,
+                                StopReasonKind::Failed,
+                                &summary,
+                            )?;
+                            Ok(self.finish(stop))
+                        }
+                    };
+                }
                 ObjectiveResponse::SubmitReport(report) => {
                     return match self.accept_submit_report(&task, report)? {
                         Ok(()) => continue,
@@ -444,6 +624,7 @@ where
                     return Ok(self.finish(stop));
                 }
                 let evidence_id = self.record_tool_evidence(&task.id, attempt, result)?;
+                self.pending_repair = None;
                 self.verify_task(&task, evidence_id)?;
                 continue;
             }
@@ -460,16 +641,25 @@ where
                 return Ok(self.finish(stop));
             }
 
-            self.record_tool_evidence(&task.id, attempt, result)?;
+            let failed_evidence_id = self.record_tool_evidence(&task.id, attempt, result)?;
             if attempt < self.options.max_repair_attempts {
                 self.repaired_after_failure = true;
+                self.pending_repair = Some(PendingRepair {
+                    task_id: task.id.clone(),
+                    failed_evidence_id,
+                });
                 self.attempts.insert(task.id.clone(), attempt + 1);
                 continue;
             }
 
+            let exhausted_kind = if self.options.max_repair_attempts == 0 {
+                RuntimeStopKind::Failed
+            } else {
+                RuntimeStopKind::RepairLoopExhausted
+            };
             let stop = self.stop_task(
                 &task.id,
-                RuntimeStopKind::Failed,
+                exhausted_kind,
                 TaskStatus::Failed,
                 StopReasonKind::Failed,
                 "Runtime failed after exhausting repair attempts.",
@@ -576,6 +766,237 @@ where
                 metadata: runtime_metadata("tool_result"),
             }))?;
         Ok(evidence_id)
+    }
+
+    fn accept_plan_repair(
+        &mut self,
+        task: &Task,
+        plan: PlanRepair,
+    ) -> Result<Result<(), PlanRepairRejection>, LedgerError> {
+        let Some(pending) = self.pending_repair.clone() else {
+            return Ok(Err(PlanRepairRejection::MissingFailedAttempt(
+                task.id.clone(),
+            )));
+        };
+        if pending.task_id != task.id {
+            return Ok(Err(PlanRepairRejection::MissingFailedAttempt(
+                task.id.clone(),
+            )));
+        }
+        if let Err(rejection) = self.validate_plan_repair(task, &plan) {
+            return Ok(Err(rejection));
+        }
+
+        for repair_task in &plan.tasks {
+            self.register_repair_task(task, repair_task)?;
+        }
+        let repair_evidence_id =
+            self.record_plan_repair_evidence(task, &pending.failed_evidence_id, &plan)?;
+        self.transition_failed_task_after_plan_repair(
+            task,
+            pending.failed_evidence_id,
+            repair_evidence_id,
+            &plan.summary,
+        )?;
+        self.pending_repair = None;
+        Ok(Ok(()))
+    }
+
+    fn validate_plan_repair(
+        &self,
+        failed_task: &Task,
+        plan: &PlanRepair,
+    ) -> Result<(), PlanRepairRejection> {
+        if plan.summary.trim().is_empty() {
+            return Err(PlanRepairRejection::EmptySummary);
+        }
+        if plan.tasks.is_empty() {
+            return Err(PlanRepairRejection::EmptyTasks);
+        }
+
+        let mut seen = BTreeSet::new();
+        let new_task_ids = plan
+            .tasks
+            .iter()
+            .map(|task| task.task_id.clone())
+            .collect::<BTreeSet<_>>();
+
+        for repair_task in &plan.tasks {
+            if repair_task.title.trim().is_empty() {
+                return Err(PlanRepairRejection::EmptyTaskTitle(
+                    repair_task.task_id.clone(),
+                ));
+            }
+            if repair_task.rationale.trim().is_empty() {
+                return Err(PlanRepairRejection::EmptyTaskRationale(
+                    repair_task.task_id.clone(),
+                ));
+            }
+            if !seen.insert(repair_task.task_id.clone()) {
+                return Err(PlanRepairRejection::DuplicateTaskId(
+                    repair_task.task_id.clone(),
+                ));
+            }
+            if self.ledger.tasks().contains_key(&repair_task.task_id) {
+                return Err(PlanRepairRejection::ExistingTaskRewrite(
+                    repair_task.task_id.clone(),
+                ));
+            }
+            if !repair_task.dependencies.contains(&failed_task.id) {
+                return Err(PlanRepairRejection::MissingFailedTaskDependency {
+                    task_id: repair_task.task_id.clone(),
+                    failed_task_id: failed_task.id.clone(),
+                });
+            }
+            for dependency_id in &repair_task.dependencies {
+                if !self.ledger.tasks().contains_key(dependency_id)
+                    && !new_task_ids.contains(dependency_id)
+                {
+                    return Err(PlanRepairRejection::UnknownDependency {
+                        task_id: repair_task.task_id.clone(),
+                        dependency_id: dependency_id.clone(),
+                    });
+                }
+            }
+            for evidence_id in &repair_task.prior_evidence_ids {
+                if !self.ledger.evidence().contains_key(evidence_id) {
+                    return Err(PlanRepairRejection::UnknownPriorEvidence {
+                        task_id: repair_task.task_id.clone(),
+                        evidence_id: evidence_id.clone(),
+                    });
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn register_repair_task(
+        &mut self,
+        failed_task: &Task,
+        repair_task: &PlanRepairTask,
+    ) -> Result<(), LedgerError> {
+        let mut metadata = runtime_metadata("plan_repair_task");
+        metadata.insert(
+            "repairFailedTaskId".to_string(),
+            serde_json::Value::String(failed_task.id.to_string()),
+        );
+        metadata.insert(
+            "repairRationale".to_string(),
+            serde_json::Value::String(repair_task.rationale.clone()),
+        );
+        metadata.insert(
+            "priorEvidenceIds".to_string(),
+            serde_json::Value::Array(
+                repair_task
+                    .prior_evidence_ids
+                    .iter()
+                    .map(|id| serde_json::Value::String(id.to_string()))
+                    .collect(),
+            ),
+        );
+
+        self.ledger.apply_update(LedgerUpdate::RegisterTask(Task {
+            id: repair_task.task_id.clone(),
+            objective_id: failed_task.objective_id.clone(),
+            title: repair_task.title.clone(),
+            description: repair_task.description.clone(),
+            status: TaskStatus::NotStarted,
+            status_updated_at: Utc::now(),
+            dependencies: repair_task.dependencies.clone(),
+            blocker_ids: Vec::new(),
+            evidence_ids: Vec::new(),
+            artifact_ids: Vec::new(),
+            checkpoint_ids: Vec::new(),
+            metadata,
+        }))?;
+        Ok(())
+    }
+
+    fn record_plan_repair_evidence(
+        &mut self,
+        failed_task: &Task,
+        failed_evidence_id: &EvidenceId,
+        plan: &PlanRepair,
+    ) -> Result<EvidenceId, LedgerError> {
+        let evidence_id = self.next_evidence_id(format!("plan-repair-{}", self.turns))?;
+        let mut metadata = runtime_metadata("plan_repair");
+        metadata.insert(
+            "failedTaskId".to_string(),
+            serde_json::Value::String(failed_task.id.to_string()),
+        );
+        metadata.insert(
+            "failedEvidenceId".to_string(),
+            serde_json::Value::String(failed_evidence_id.to_string()),
+        );
+        metadata.insert(
+            "repairTaskIds".to_string(),
+            serde_json::Value::Array(
+                plan.tasks
+                    .iter()
+                    .map(|task| serde_json::Value::String(task.task_id.to_string()))
+                    .collect(),
+            ),
+        );
+        metadata.insert(
+            "repairTaskCount".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(plan.tasks.len() as u64)),
+        );
+
+        let mut subjects = vec![EntityRef::Task(failed_task.id.clone())];
+        subjects.extend(
+            plan.tasks
+                .iter()
+                .map(|task| EntityRef::Task(task.task_id.clone())),
+        );
+        self.ledger
+            .apply_update(LedgerUpdate::RecordEvidence(Evidence {
+                id: evidence_id.clone(),
+                kind: EvidenceKind::Inspection,
+                summary: format!("PlanRepair accepted: {}", plan.summary),
+                collected_at: Utc::now(),
+                collected_by: self.actor.clone(),
+                result: EvidenceResult::Passed,
+                subjects,
+                command: None,
+                source_refs: Vec::new(),
+                artifact_ids: Vec::new(),
+                metadata,
+            }))?;
+        Ok(evidence_id)
+    }
+
+    fn transition_failed_task_after_plan_repair(
+        &mut self,
+        task: &Task,
+        failed_evidence_id: EvidenceId,
+        repair_evidence_id: EvidenceId,
+        summary: &str,
+    ) -> Result<(), LedgerError> {
+        let stop_reason_id = self.record_task_stop_reason(
+            &task.id,
+            StopReasonKind::Failed,
+            &format!("Failed task handed off to bounded plan repair: {summary}"),
+        )?;
+        let cleanup_evidence_id = self.record_cleanup_evidence(
+            &task.id,
+            RuntimeStopKind::RepairLoopExhausted,
+            TaskStatus::Failed,
+            "Runtime cleanup completed before downstream repair tasks run.",
+        )?;
+        self.ledger
+            .apply_update(LedgerUpdate::UpdateTaskStatus(TaskStatusUpdate {
+                task_id: task.id.clone(),
+                status: TaskStatus::Failed,
+                updated_at: Utc::now(),
+                updated_by: self.actor.clone(),
+                evidence_ids: vec![failed_evidence_id, repair_evidence_id, cleanup_evidence_id],
+                blocker_ids: task.blocker_ids.clone(),
+                stop_reason_id: Some(stop_reason_id),
+                verification_waiver_id: None,
+                metadata: runtime_metadata("plan_repair_triggered"),
+            }))?;
+        Ok(())
     }
 
     fn accept_submit_report(
@@ -1021,6 +1442,8 @@ fn runtime_stop_slug(kind: RuntimeStopKind) -> &'static str {
         RuntimeStopKind::BudgetExceeded => "budget-exceeded",
         RuntimeStopKind::Failed => "failed",
         RuntimeStopKind::ModelMessageWithoutEvidence => "model-message-without-evidence",
+        RuntimeStopKind::PlanRepairRejected => "plan-repair-rejected",
+        RuntimeStopKind::RepairLoopExhausted => "repair-loop-exhausted",
         RuntimeStopKind::SubmitReportRequired => "submit-report-required",
         RuntimeStopKind::SubmitReportRejected => "submit-report-rejected",
     }
@@ -1097,6 +1520,10 @@ mod tests {
 
     fn child_task_id() -> TaskId {
         TaskId::parse("task/runtime-child").expect("child task id")
+    }
+
+    fn repair_task_id() -> TaskId {
+        TaskId::parse("task/runtime-repair").expect("repair task id")
     }
 
     fn evidence_id() -> EvidenceId {
@@ -1232,6 +1659,36 @@ mod tests {
                 metadata: runtime_metadata("cleanup"),
             }))
             .expect("record cleanup evidence");
+    }
+
+    fn plan_repair(prior_evidence_ids: Vec<EvidenceId>) -> PlanRepair {
+        PlanRepair {
+            summary: "Rewrite downstream task after child failure.".to_string(),
+            tasks: vec![PlanRepairTask {
+                task_id: repair_task_id(),
+                title: "Run repaired downstream work".to_string(),
+                description: Some(
+                    "Uses the failed child output and any prior accepted result.".to_string(),
+                ),
+                dependencies: vec![task_id()],
+                prior_evidence_ids,
+                rationale: "Only downstream work is rewritten after the failed child.".to_string(),
+            }],
+        }
+    }
+
+    fn plan_repair_evidence(ledger: &CoworkLedger) -> Vec<&Evidence> {
+        ledger
+            .evidence()
+            .values()
+            .filter(|evidence| {
+                evidence
+                    .metadata
+                    .get("runtimeEvent")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("plan_repair")
+            })
+            .collect()
     }
 
     fn record_artifact(ledger: &mut CoworkLedger) {
@@ -1434,6 +1891,207 @@ mod tests {
             evidence.kind == EvidenceKind::FailedAttempt
                 && evidence.summary == "child tool failed"
                 && evidence.subjects == vec![EntityRef::Task(task_id())]
+        }));
+    }
+
+    #[test]
+    fn plan_repair_suite_repair_loop_exhaustion_is_bounded_and_records_cleanup() {
+        let (ledger, report) = CoworkRuntime::new(
+            ledger_with_task(TaskStatus::NotStarted),
+            SequenceDriver::new(vec![
+                ToolResult::failed("initial child failure").into(),
+                ToolResult::failed("repair attempt also failed").into(),
+            ]),
+            RuntimeOptions {
+                max_repair_attempts: 1,
+                ..RuntimeOptions::default()
+            },
+            actor(),
+        )
+        .run()
+        .expect("runtime run");
+
+        assert_eq!(report.stop.kind, RuntimeStopKind::RepairLoopExhausted);
+        assert_eq!(report.tool_calls, 2);
+        assert_eq!(report.cleanup_records, 1);
+        assert_eq!(
+            ledger.tasks().get(&task_id()).unwrap().status,
+            TaskStatus::Failed
+        );
+        let cleanup = cleanup_evidence(&ledger);
+        assert_eq!(
+            cleanup[0].metadata.get("cleanupStopKind"),
+            Some(&serde_json::json!("repair_loop_exhausted"))
+        );
+        assert!(ledger.stop_reasons().values().any(|reason| {
+            reason.kind == StopReasonKind::Failed
+                && reason.summary.contains("exhausting repair attempts")
+        }));
+    }
+
+    #[test]
+    fn plan_repair_suite_failed_child_registers_downstream_repair_task() {
+        let (ledger, report) = CoworkRuntime::new(
+            ledger_with_task(TaskStatus::NotStarted),
+            SequenceDriver::new(vec![
+                ToolResult::failed("child tool failed").into(),
+                plan_repair(Vec::new()).into(),
+                ToolResult::passed("repaired downstream task passed").into(),
+            ]),
+            RuntimeOptions::default(),
+            actor(),
+        )
+        .run()
+        .expect("runtime run");
+
+        assert!(report.repaired_after_failure);
+        assert_eq!(report.stop.kind, RuntimeStopKind::NoReadyTask);
+        assert_eq!(
+            ledger.tasks().get(&task_id()).unwrap().status,
+            TaskStatus::Failed
+        );
+        let repair_task = ledger.tasks().get(&repair_task_id()).unwrap();
+        assert_eq!(repair_task.status, TaskStatus::Verified);
+        assert_eq!(repair_task.dependencies, vec![task_id()]);
+        let repairs = plan_repair_evidence(&ledger);
+        assert_eq!(repairs.len(), 1);
+        assert_eq!(repairs[0].result, EvidenceResult::Passed);
+        assert!(repairs[0]
+            .subjects
+            .contains(&EntityRef::Task(repair_task_id())));
+        assert_eq!(
+            repairs[0].metadata.get("repairTaskIds"),
+            Some(&serde_json::json!(["task/runtime-repair"]))
+        );
+    }
+
+    #[test]
+    fn plan_repair_suite_prior_agent_result_ids_are_passed_to_downstream_task() {
+        let mut ledger = ledger_with_task(TaskStatus::NotStarted);
+        record_passed_evidence(&mut ledger);
+
+        let (ledger, _report) = CoworkRuntime::new(
+            ledger,
+            SequenceDriver::new(vec![
+                ToolResult::failed("child needs repair").into(),
+                plan_repair(vec![evidence_id()]).into(),
+                ToolResult::passed("repair consumed prior result").into(),
+            ]),
+            RuntimeOptions::default(),
+            actor(),
+        )
+        .run()
+        .expect("runtime run");
+
+        let repair_task = ledger.tasks().get(&repair_task_id()).unwrap();
+        assert_eq!(repair_task.status, TaskStatus::Verified);
+        assert_eq!(
+            repair_task.metadata.get("priorEvidenceIds"),
+            Some(&serde_json::json!(["evidence/subagent-acceptance"]))
+        );
+        let repairs = plan_repair_evidence(&ledger);
+        assert_eq!(
+            repairs[0].metadata.get("failedEvidenceId"),
+            Some(&serde_json::json!("evidence/runtime-turn-1-attempt-0"))
+        );
+    }
+
+    #[test]
+    fn plan_repair_suite_malformed_json_is_rejected_without_repair_task() {
+        let (ledger, report) = CoworkRuntime::new(
+            ledger_with_task(TaskStatus::NotStarted),
+            SequenceDriver::new(vec![
+                ToolResult::failed("child needs repair").into(),
+                ObjectiveResponse::PlanRepairJson("{ not json".to_string()),
+            ]),
+            RuntimeOptions::default(),
+            actor(),
+        )
+        .run()
+        .expect("runtime run");
+
+        assert_eq!(report.stop.kind, RuntimeStopKind::PlanRepairRejected);
+        assert_eq!(report.final_task_status, Some(TaskStatus::Failed));
+        assert!(!ledger.tasks().contains_key(&repair_task_id()));
+        assert!(plan_repair_evidence(&ledger).is_empty());
+        assert_ne!(
+            ledger.tasks().get(&task_id()).unwrap().status,
+            TaskStatus::Verified
+        );
+        assert!(ledger.stop_reasons().values().any(|reason| {
+            reason.kind == StopReasonKind::Failed && reason.summary.contains("PlanRepair rejected")
+        }));
+    }
+
+    #[test]
+    fn plan_repair_suite_existing_upstream_task_rewrite_is_rejected() {
+        let invalid_repair = PlanRepair {
+            summary: "Try to rewrite the failed task directly.".to_string(),
+            tasks: vec![PlanRepairTask {
+                task_id: task_id(),
+                title: "Mutate failed task".to_string(),
+                description: None,
+                dependencies: vec![task_id()],
+                prior_evidence_ids: Vec::new(),
+                rationale: "This would rewrite existing plan history.".to_string(),
+            }],
+        };
+        let (ledger, report) = CoworkRuntime::new(
+            ledger_with_task(TaskStatus::NotStarted),
+            SequenceDriver::new(vec![
+                ToolResult::failed("child needs repair").into(),
+                invalid_repair.into(),
+            ]),
+            RuntimeOptions::default(),
+            actor(),
+        )
+        .run()
+        .expect("runtime run");
+
+        assert_eq!(report.stop.kind, RuntimeStopKind::PlanRepairRejected);
+        assert_eq!(ledger.tasks().len(), 1);
+        assert!(plan_repair_evidence(&ledger).is_empty());
+        assert!(ledger.stop_reasons().values().any(|reason| {
+            reason
+                .summary
+                .contains("attempts to rewrite existing task 'task/runtime-test'")
+        }));
+    }
+
+    #[test]
+    fn plan_repair_suite_json_parser_accepts_valid_plan_and_rejects_unknown_prior_result() {
+        let json = serde_json::json!({
+            "summary": "Add downstream repair",
+            "tasks": [{
+                "taskId": "task/runtime-repair",
+                "title": "Run repair",
+                "dependencies": ["task/runtime-test"],
+                "priorEvidenceIds": ["evidence/subagent-acceptance"],
+                "rationale": "Use prior accepted child result"
+            }]
+        })
+        .to_string();
+        let parsed = PlanRepair::from_json(&json).expect("valid repair plan");
+        assert_eq!(parsed.tasks[0].task_id, repair_task_id());
+
+        let (ledger, report) = CoworkRuntime::new(
+            ledger_with_task(TaskStatus::NotStarted),
+            SequenceDriver::new(vec![
+                ToolResult::failed("child needs repair").into(),
+                ObjectiveResponse::PlanRepairJson(json),
+            ]),
+            RuntimeOptions::default(),
+            actor(),
+        )
+        .run()
+        .expect("runtime run");
+
+        assert_eq!(report.stop.kind, RuntimeStopKind::PlanRepairRejected);
+        assert!(!ledger.tasks().contains_key(&repair_task_id()));
+        assert!(ledger.stop_reasons().values().any(|reason| {
+            reason
+                .summary
+                .contains("references unknown prior evidence 'evidence/subagent-acceptance'")
         }));
     }
 
