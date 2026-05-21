@@ -5,6 +5,8 @@
 //! root objective observation and at least one task/evidence contract record
 //! survive trimming when they exist in the ledger.
 
+pub mod retrieval;
+
 use cowork_ledger::{
     ArtifactId, ArtifactKind, BlockerId, BlockerStatus, CheckpointId, CoworkLedger, EntityRef,
     EvidenceId, EvidenceKind, EvidenceResult, EvidenceSourceRef, Metadata, ObjectiveProgress,

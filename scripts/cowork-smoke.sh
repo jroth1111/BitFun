@@ -174,11 +174,23 @@ run_step "daemon export json" \
   cargo run -q -p bitfun-cli -- daemon export --format json
 run_step "daemon export markdown" \
   cargo run -q -p bitfun-cli -- daemon export --format markdown
+run_step "daemon retrieve task" \
+  cargo run -q -p bitfun-cli -- daemon retrieve --kind task --id cowork-smoke-connect
+run_step "daemon retrieve checkpoint range" \
+  cargo run -q -p bitfun-cli -- daemon retrieve --kind checkpoint --sequence-start 1 --sequence-end 1
+run_step "daemon retrieve query" \
+  cargo run -q -p bitfun-cli -- daemon retrieve --query protocol
 run_negative_smoke "daemon unsupported endpoint" "unsupported_endpoint" "invalid_request" \
   cargo run -q -p bitfun-cli -- daemon start --endpoint unsupported-endpoint
 run_negative_smoke "daemon unsupported target" "unsupported_target" "invalid_request" \
   cargo run -q -p bitfun-cli -- daemon start --target unsupported-target
 run_negative_smoke "daemon unsupported export format" "unsupported_export_format" "invalid_request" \
   cargo run -q -p bitfun-cli -- daemon export --format yaml
+run_negative_smoke "daemon missing history record" "history_record_not_found" "not_found" \
+  cargo run -q -p bitfun-cli -- daemon retrieve --kind evidence --id missing-evidence
+run_negative_smoke "daemon unsupported retrieval target" "unsupported_retrieval_target" "invalid_request" \
+  cargo run -q -p bitfun-cli -- daemon retrieve --kind turn
+run_negative_smoke "daemon invalid retrieval range" "invalid_history_range" "invalid_request" \
+  cargo run -q -p bitfun-cli -- daemon retrieve --kind checkpoint --sequence-start 2 --sequence-end 1
 
 printf "Cowork smoke passed. Log: %s\n" "${LOG_FILE}"

@@ -2,6 +2,7 @@ use clap::{Args, Subcommand};
 use cowork_protocol::{
     Artifact, ArtifactKind, ArtifactProvenance, AuthorityInvariant, BrowserAdapter, BrowserSession,
     BrowserState, BrowserStatus, BrowserTab, Checkpoint, CoworkSnapshot, Evidence, EvidenceKind,
+    HistoryRetrievalRequest, HistoryRetrievalResult, HistoryRetrievalTarget, HistorySequenceRange,
     Metadata, Objective, ObjectiveStatus, ProtocolEnvelope, ProtocolError, ProtocolErrorCode,
     ProtocolVersion, Provider, ProviderCapability, ProviderKind, ProviderStatus, RunStatus,
     Subagent, SubagentStatus, Task, TaskStatus,
@@ -13,6 +14,7 @@ use std::fmt;
 const SUPPORTED_ENDPOINT: &str = "in-process";
 const SUPPORTED_TARGET: &str = "local-smoke";
 const START_RESPONSE_ID: &str = "cowork-daemon-start";
+const RETRIEVE_RESPONSE_ID: &str = "cowork-daemon-retrieve";
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum DaemonAction {
@@ -22,6 +24,8 @@ pub enum DaemonAction {
     Status(DaemonSmokeOptions),
     /// Export the deterministic CoworkSnapshot smoke state as JSON or Markdown
     Export(DaemonExportOptions),
+    /// Retrieve exact historical Cowork records from the deterministic smoke daemon
+    Retrieve(DaemonRetrieveOptions),
 }
 
 #[derive(Debug, Clone, Args, PartialEq, Eq)]
@@ -63,6 +67,45 @@ impl Default for DaemonExportOptions {
     }
 }
 
+#[derive(Debug, Clone, Args, PartialEq, Eq)]
+pub struct DaemonRetrieveOptions {
+    #[command(flatten)]
+    pub smoke: DaemonSmokeOptions,
+
+    /// History target kind: all, objective, task, evidence, checkpoint, artifact, subagent, provider, browser.
+    #[arg(long, default_value = "all")]
+    pub kind: String,
+
+    /// Exact record ID to retrieve.
+    #[arg(long)]
+    pub id: Option<String>,
+
+    /// Text query matched against IDs, titles, summaries, labels, and URIs.
+    #[arg(long)]
+    pub query: Option<String>,
+
+    /// Inclusive checkpoint sequence range start.
+    #[arg(long)]
+    pub sequence_start: Option<u64>,
+
+    /// Inclusive checkpoint sequence range end.
+    #[arg(long)]
+    pub sequence_end: Option<u64>,
+}
+
+impl Default for DaemonRetrieveOptions {
+    fn default() -> Self {
+        Self {
+            smoke: DaemonSmokeOptions::default(),
+            kind: "all".to_string(),
+            id: None,
+            query: None,
+            sequence_start: None,
+            sequence_end: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DaemonExportFormat {
     Json,
@@ -93,6 +136,7 @@ pub fn run_action(action: DaemonAction) -> Result<String, CoworkDaemonSmokeError
         DaemonAction::Start(options) => to_pretty_json(&start_output(options)?),
         DaemonAction::Status(options) => to_pretty_json(&status_output(options)?),
         DaemonAction::Export(options) => export_output(options),
+        DaemonAction::Retrieve(options) => retrieve_output(options),
     }
 }
 
@@ -149,6 +193,474 @@ fn export_output(options: DaemonExportOptions) -> Result<String, CoworkDaemonSmo
         DaemonExportFormat::Json => to_pretty_json(&snapshot),
         DaemonExportFormat::Markdown => Ok(render_snapshot_markdown(&snapshot)),
     }
+}
+
+fn retrieve_output(options: DaemonRetrieveOptions) -> Result<String, CoworkDaemonSmokeError> {
+    let request = options.into_request()?;
+    let snapshot = export_snapshot(options.smoke)?;
+    let result = retrieve_history(&snapshot, request)?;
+
+    to_pretty_json(&ProtocolEnvelope::response(RETRIEVE_RESPONSE_ID, result))
+}
+
+impl DaemonRetrieveOptions {
+    fn into_request(&self) -> Result<HistoryRetrievalRequest, CoworkDaemonSmokeError> {
+        let sequence_range = match (self.sequence_start, self.sequence_end) {
+            (Some(start), Some(end)) if start <= end => Some(HistorySequenceRange { start, end }),
+            (Some(start), Some(end)) => {
+                return Err(CoworkDaemonSmokeError::InvalidHistoryRange { start, end });
+            }
+            (Some(sequence), None) | (None, Some(sequence)) => Some(HistorySequenceRange {
+                start: sequence,
+                end: sequence,
+            }),
+            (None, None) => None,
+        };
+
+        Ok(HistoryRetrievalRequest {
+            target: parse_history_target(&self.kind)?,
+            id: self.id.clone(),
+            query: normalize_query(self.query.as_deref())?,
+            sequence_range,
+            include_linked: true,
+        })
+    }
+}
+
+fn parse_history_target(input: &str) -> Result<HistoryRetrievalTarget, CoworkDaemonSmokeError> {
+    match input {
+        "all" => Ok(HistoryRetrievalTarget::All),
+        "objective" => Ok(HistoryRetrievalTarget::Objective),
+        "task" | "tasks" => Ok(HistoryRetrievalTarget::Task),
+        "evidence" => Ok(HistoryRetrievalTarget::Evidence),
+        "checkpoint" | "checkpoints" => Ok(HistoryRetrievalTarget::Checkpoint),
+        "artifact" | "artifacts" => Ok(HistoryRetrievalTarget::Artifact),
+        "subagent" | "subagents" => Ok(HistoryRetrievalTarget::Subagent),
+        "provider" | "providers" => Ok(HistoryRetrievalTarget::Provider),
+        "browser" => Ok(HistoryRetrievalTarget::Browser),
+        target => Err(CoworkDaemonSmokeError::UnsupportedRetrievalTarget {
+            target: target.to_string(),
+        }),
+    }
+}
+
+fn normalize_query(input: Option<&str>) -> Result<Option<String>, CoworkDaemonSmokeError> {
+    input
+        .map(str::trim)
+        .map(|query| {
+            if query.is_empty() {
+                Err(CoworkDaemonSmokeError::EmptyHistoryQuery)
+            } else {
+                Ok(query.to_ascii_lowercase())
+            }
+        })
+        .transpose()
+}
+
+fn retrieve_history(
+    snapshot: &CoworkSnapshot,
+    request: HistoryRetrievalRequest,
+) -> Result<HistoryRetrievalResult, CoworkDaemonSmokeError> {
+    let mut result = HistoryRetrievalResult {
+        request: request.clone(),
+        objective: None,
+        tasks: Vec::new(),
+        evidence: Vec::new(),
+        checkpoints: Vec::new(),
+        artifacts: Vec::new(),
+        subagents: Vec::new(),
+        providers: Vec::new(),
+        browser: None,
+        result_count: 0,
+    };
+
+    collect_direct_matches(snapshot, &request, &mut result);
+    if request.include_linked {
+        collect_linked_records(snapshot, &mut result);
+    }
+    result.result_count = result_record_count(&result);
+
+    if result.result_count == 0 {
+        return Err(CoworkDaemonSmokeError::HistoryRecordNotFound {
+            target: history_target_label(request.target),
+            selector: history_selector_label(&request),
+        });
+    }
+
+    Ok(result)
+}
+
+fn collect_direct_matches(
+    snapshot: &CoworkSnapshot,
+    request: &HistoryRetrievalRequest,
+    result: &mut HistoryRetrievalResult,
+) {
+    if matches!(
+        request.target,
+        HistoryRetrievalTarget::All | HistoryRetrievalTarget::Objective
+    ) && objective_matches(&snapshot.objective, request)
+    {
+        result.objective = Some(snapshot.objective.clone());
+    }
+
+    if matches!(
+        request.target,
+        HistoryRetrievalTarget::All | HistoryRetrievalTarget::Task
+    ) {
+        result.tasks.extend(
+            snapshot
+                .tasks
+                .iter()
+                .filter(|task| task_matches(task, request))
+                .cloned(),
+        );
+    }
+
+    if matches!(
+        request.target,
+        HistoryRetrievalTarget::All | HistoryRetrievalTarget::Evidence
+    ) {
+        result.evidence.extend(
+            snapshot
+                .evidence
+                .iter()
+                .filter(|evidence| evidence_matches(evidence, request))
+                .cloned(),
+        );
+    }
+
+    if matches!(
+        request.target,
+        HistoryRetrievalTarget::All | HistoryRetrievalTarget::Checkpoint
+    ) {
+        result.checkpoints.extend(
+            snapshot
+                .checkpoints
+                .iter()
+                .filter(|checkpoint| checkpoint_matches(checkpoint, request))
+                .cloned(),
+        );
+    }
+
+    if matches!(
+        request.target,
+        HistoryRetrievalTarget::All | HistoryRetrievalTarget::Artifact
+    ) {
+        result.artifacts.extend(
+            snapshot
+                .artifacts
+                .iter()
+                .filter(|artifact| artifact_matches(artifact, request))
+                .cloned(),
+        );
+    }
+
+    if matches!(
+        request.target,
+        HistoryRetrievalTarget::All | HistoryRetrievalTarget::Subagent
+    ) {
+        result.subagents.extend(
+            snapshot
+                .subagents
+                .iter()
+                .filter(|subagent| subagent_matches(subagent, request))
+                .cloned(),
+        );
+    }
+
+    if matches!(
+        request.target,
+        HistoryRetrievalTarget::All | HistoryRetrievalTarget::Provider
+    ) {
+        result.providers.extend(
+            snapshot
+                .providers
+                .iter()
+                .filter(|provider| provider_matches(provider, request))
+                .cloned(),
+        );
+    }
+
+    if matches!(
+        request.target,
+        HistoryRetrievalTarget::All | HistoryRetrievalTarget::Browser
+    ) && browser_matches(&snapshot.browser, request)
+    {
+        result.browser = Some(snapshot.browser.clone());
+    }
+}
+
+fn collect_linked_records(snapshot: &CoworkSnapshot, result: &mut HistoryRetrievalResult) {
+    let task_ids = result
+        .tasks
+        .iter()
+        .map(|task| task.id.clone())
+        .chain(
+            result
+                .evidence
+                .iter()
+                .filter_map(|evidence| evidence.task_id.clone()),
+        )
+        .chain(
+            result
+                .checkpoints
+                .iter()
+                .flat_map(|checkpoint| checkpoint.task_ids.iter().cloned()),
+        )
+        .chain(
+            result
+                .artifacts
+                .iter()
+                .filter_map(|artifact| artifact.provenance.task_id.clone()),
+        )
+        .collect::<Vec<_>>();
+    for task_id in &task_ids {
+        push_unique(&mut result.tasks, &snapshot.tasks, |task| {
+            &task.id == task_id
+        });
+    }
+
+    let evidence_ids = result
+        .evidence
+        .iter()
+        .map(|evidence| evidence.id.clone())
+        .chain(
+            result
+                .tasks
+                .iter()
+                .flat_map(|task| task.evidence_ids.iter().cloned()),
+        )
+        .chain(
+            result
+                .checkpoints
+                .iter()
+                .flat_map(|checkpoint| checkpoint.evidence_ids.iter().cloned()),
+        )
+        .chain(
+            result
+                .artifacts
+                .iter()
+                .flat_map(|artifact| artifact.evidence_ids.iter().cloned()),
+        )
+        .collect::<Vec<_>>();
+    for evidence_id in &evidence_ids {
+        push_unique(&mut result.evidence, &snapshot.evidence, |evidence| {
+            &evidence.id == evidence_id
+        });
+    }
+
+    let checkpoint_ids = result
+        .checkpoints
+        .iter()
+        .map(|checkpoint| checkpoint.id.clone())
+        .chain(
+            result
+                .evidence
+                .iter()
+                .filter_map(|evidence| evidence.checkpoint_id.clone()),
+        )
+        .collect::<Vec<_>>();
+    for checkpoint_id in &checkpoint_ids {
+        push_unique(
+            &mut result.checkpoints,
+            &snapshot.checkpoints,
+            |checkpoint| &checkpoint.id == checkpoint_id,
+        );
+    }
+
+    let artifact_ids = result
+        .artifacts
+        .iter()
+        .map(|artifact| artifact.id.clone())
+        .chain(
+            result
+                .tasks
+                .iter()
+                .flat_map(|task| task.artifact_ids.iter().cloned()),
+        )
+        .chain(
+            result
+                .evidence
+                .iter()
+                .flat_map(|evidence| evidence.artifact_ids.iter().cloned()),
+        )
+        .chain(
+            result
+                .checkpoints
+                .iter()
+                .flat_map(|checkpoint| checkpoint.artifact_ids.iter().cloned()),
+        )
+        .collect::<Vec<_>>();
+    for artifact_id in &artifact_ids {
+        push_unique(&mut result.artifacts, &snapshot.artifacts, |artifact| {
+            &artifact.id == artifact_id
+        });
+    }
+}
+
+fn push_unique<T: Clone>(target: &mut Vec<T>, source: &[T], predicate: impl Fn(&T) -> bool)
+where
+    T: PartialEq,
+{
+    for item in source.iter().filter(|item| predicate(item)) {
+        if !target.contains(item) {
+            target.push(item.clone());
+        }
+    }
+}
+
+fn objective_matches(objective: &Objective, request: &HistoryRetrievalRequest) -> bool {
+    id_matches(&objective.id, request)
+        && query_matches(
+            [
+                objective.id.as_str(),
+                objective.instruction.as_str(),
+                &objective.constraints.join(" "),
+                &objective.acceptance_criteria.join(" "),
+            ],
+            request,
+        )
+        && request.sequence_range.is_none()
+}
+
+fn task_matches(task: &Task, request: &HistoryRetrievalRequest) -> bool {
+    id_matches(&task.id, request)
+        && query_matches([task.id.as_str(), task.title.as_str()], request)
+        && request.sequence_range.is_none()
+}
+
+fn evidence_matches(evidence: &Evidence, request: &HistoryRetrievalRequest) -> bool {
+    id_matches(&evidence.id, request)
+        && query_matches([evidence.id.as_str(), evidence.summary.as_str()], request)
+        && request.sequence_range.is_none()
+}
+
+fn checkpoint_matches(checkpoint: &Checkpoint, request: &HistoryRetrievalRequest) -> bool {
+    id_matches(&checkpoint.id, request)
+        && query_matches(
+            [checkpoint.id.as_str(), checkpoint.summary.as_str()],
+            request,
+        )
+        && sequence_matches(checkpoint.sequence, request)
+}
+
+fn artifact_matches(artifact: &Artifact, request: &HistoryRetrievalRequest) -> bool {
+    id_matches(&artifact.id, request)
+        && query_matches(
+            [
+                artifact.id.as_str(),
+                artifact.title.as_str(),
+                artifact.uri.as_deref().unwrap_or_default(),
+            ],
+            request,
+        )
+        && request.sequence_range.is_none()
+}
+
+fn subagent_matches(subagent: &Subagent, request: &HistoryRetrievalRequest) -> bool {
+    id_matches(&subagent.id, request)
+        && query_matches(
+            [
+                subagent.id.as_str(),
+                subagent.name.as_str(),
+                subagent.role.as_str(),
+            ],
+            request,
+        )
+        && request.sequence_range.is_none()
+}
+
+fn provider_matches(provider: &Provider, request: &HistoryRetrievalRequest) -> bool {
+    id_matches(&provider.id, request)
+        && query_matches([provider.id.as_str(), provider.label.as_str()], request)
+        && request.sequence_range.is_none()
+}
+
+fn browser_matches(browser: &BrowserState, request: &HistoryRetrievalRequest) -> bool {
+    request.sequence_range.is_none()
+        && request.id.as_ref().map_or(true, |id| {
+            browser.active_session_id.as_ref() == Some(id)
+                || browser.sessions.iter().any(|session| {
+                    &session.id == id || session.tabs.iter().any(|tab| &tab.id == id)
+                })
+        })
+        && request.query.as_ref().map_or(true, |query| {
+            browser.sessions.iter().any(|session| {
+                contains_query(&session.id, query)
+                    || session.tabs.iter().any(|tab| {
+                        contains_query(&tab.id, query)
+                            || tab
+                                .title
+                                .as_deref()
+                                .is_some_and(|title| contains_query(title, query))
+                            || tab
+                                .url
+                                .as_deref()
+                                .is_some_and(|url| contains_query(url, query))
+                    })
+            })
+        })
+}
+
+fn id_matches(record_id: &str, request: &HistoryRetrievalRequest) -> bool {
+    request.id.as_ref().map_or(true, |id| id == record_id)
+}
+
+fn query_matches<'a>(
+    values: impl IntoIterator<Item = &'a str>,
+    request: &HistoryRetrievalRequest,
+) -> bool {
+    request.query.as_ref().map_or(true, |query| {
+        values.into_iter().any(|value| contains_query(value, query))
+    })
+}
+
+fn sequence_matches(sequence: u64, request: &HistoryRetrievalRequest) -> bool {
+    request.sequence_range.map_or(true, |range| {
+        sequence >= range.start && sequence <= range.end
+    })
+}
+
+fn contains_query(value: &str, query: &str) -> bool {
+    value.to_ascii_lowercase().contains(query)
+}
+
+fn result_record_count(result: &HistoryRetrievalResult) -> usize {
+    usize::from(result.objective.is_some())
+        + result.tasks.len()
+        + result.evidence.len()
+        + result.checkpoints.len()
+        + result.artifacts.len()
+        + result.subagents.len()
+        + result.providers.len()
+        + usize::from(result.browser.is_some())
+}
+
+fn history_target_label(target: HistoryRetrievalTarget) -> &'static str {
+    match target {
+        HistoryRetrievalTarget::All => "all",
+        HistoryRetrievalTarget::Objective => "objective",
+        HistoryRetrievalTarget::Task => "task",
+        HistoryRetrievalTarget::Evidence => "evidence",
+        HistoryRetrievalTarget::Checkpoint => "checkpoint",
+        HistoryRetrievalTarget::Artifact => "artifact",
+        HistoryRetrievalTarget::Subagent => "subagent",
+        HistoryRetrievalTarget::Provider => "provider",
+        HistoryRetrievalTarget::Browser => "browser",
+    }
+}
+
+fn history_selector_label(request: &HistoryRetrievalRequest) -> String {
+    if let Some(id) = &request.id {
+        return format!("id '{id}'");
+    }
+    if let Some(query) = &request.query {
+        return format!("query '{query}'");
+    }
+    if let Some(range) = request.sequence_range {
+        return format!("sequence {}..{}", range.start, range.end);
+    }
+    "all records".to_string()
 }
 
 fn start_and_connect(
@@ -701,11 +1213,31 @@ impl LocalSmokeDaemon {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CoworkDaemonSmokeError {
-    UnsupportedEndpoint { endpoint: String },
-    UnsupportedTarget { target: String },
-    UnsupportedExportFormat { format: String },
+    UnsupportedEndpoint {
+        endpoint: String,
+    },
+    UnsupportedTarget {
+        target: String,
+    },
+    UnsupportedExportFormat {
+        format: String,
+    },
+    UnsupportedRetrievalTarget {
+        target: String,
+    },
+    HistoryRecordNotFound {
+        target: &'static str,
+        selector: String,
+    },
+    InvalidHistoryRange {
+        start: u64,
+        end: u64,
+    },
+    EmptyHistoryQuery,
     NotStarted,
-    Serialization { message: String },
+    Serialization {
+        message: String,
+    },
 }
 
 impl CoworkDaemonSmokeError {
@@ -714,6 +1246,10 @@ impl CoworkDaemonSmokeError {
             Self::UnsupportedEndpoint { .. } => "unsupported_endpoint",
             Self::UnsupportedTarget { .. } => "unsupported_target",
             Self::UnsupportedExportFormat { .. } => "unsupported_export_format",
+            Self::UnsupportedRetrievalTarget { .. } => "unsupported_retrieval_target",
+            Self::HistoryRecordNotFound { .. } => "history_record_not_found",
+            Self::InvalidHistoryRange { .. } => "invalid_history_range",
+            Self::EmptyHistoryQuery => "empty_history_query",
             Self::NotStarted => "daemon_not_started",
             Self::Serialization { .. } => "serialization_failed",
         }
@@ -735,6 +1271,22 @@ impl CoworkDaemonSmokeError {
                 message: format!(
                     "unsupported Cowork daemon export format '{format}'; supported formats are 'json' and 'markdown'"
                 ),
+            },
+            Self::UnsupportedRetrievalTarget { target } => ProtocolError::InvalidRequest {
+                message: format!(
+                    "unsupported Cowork daemon history retrieval target '{target}'; supported targets are all, objective, task, evidence, checkpoint, artifact, subagent, provider, and browser"
+                ),
+            },
+            Self::HistoryRecordNotFound { target, selector } => ProtocolError::NotFound {
+                resource: format!("Cowork history {target} record for {selector}"),
+            },
+            Self::InvalidHistoryRange { start, end } => ProtocolError::InvalidRequest {
+                message: format!(
+                    "invalid Cowork history checkpoint sequence range {start}..{end}; start must be less than or equal to end"
+                ),
+            },
+            Self::EmptyHistoryQuery => ProtocolError::InvalidRequest {
+                message: "Cowork history retrieval query cannot be empty".to_string(),
             },
             Self::NotStarted => ProtocolError::Conflict {
                 message: "Cowork smoke daemon has not been started".to_string(),
@@ -780,6 +1332,27 @@ impl fmt::Display for CoworkDaemonSmokeError {
                     formatter,
                     "unsupported Cowork daemon export format '{format}'"
                 )
+            }
+            Self::UnsupportedRetrievalTarget { target } => {
+                write!(
+                    formatter,
+                    "unsupported Cowork daemon history retrieval target '{target}'"
+                )
+            }
+            Self::HistoryRecordNotFound { target, selector } => {
+                write!(
+                    formatter,
+                    "Cowork history {target} record not found for {selector}"
+                )
+            }
+            Self::InvalidHistoryRange { start, end } => {
+                write!(
+                    formatter,
+                    "invalid Cowork history checkpoint sequence range {start}..{end}"
+                )
+            }
+            Self::EmptyHistoryQuery => {
+                formatter.write_str("Cowork history retrieval query cannot be empty")
             }
             Self::NotStarted => formatter.write_str("Cowork smoke daemon has not been started"),
             Self::Serialization { message } => {
@@ -966,6 +1539,125 @@ mod tests {
         assert_eq!(
             to_pretty_json(&first).expect("first json"),
             to_pretty_json(&second).expect("second json")
+        );
+    }
+
+    #[test]
+    fn retrieve_task_by_id_returns_exact_linked_state() {
+        let json = run_action(DaemonAction::Retrieve(DaemonRetrieveOptions {
+            smoke: DaemonSmokeOptions::default(),
+            kind: "task".to_string(),
+            id: Some("cowork-smoke-connect".to_string()),
+            query: None,
+            sequence_start: None,
+            sequence_end: None,
+        }))
+        .expect("retrieve task");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("parse retrieve json");
+
+        assert_eq!(value["kind"], "response");
+        assert_eq!(value["result"]["request"]["target"], "task");
+        assert_eq!(value["result"]["tasks"][0]["id"], "cowork-smoke-connect");
+        assert_eq!(
+            value["result"]["evidence"][0]["id"],
+            "cowork-smoke-evidence"
+        );
+        assert_eq!(
+            value["result"]["artifacts"][0]["id"],
+            "cowork-smoke-snapshot"
+        );
+        assert_eq!(
+            value["result"]["checkpoints"][0]["id"],
+            "cowork-smoke-checkpoint"
+        );
+    }
+
+    #[test]
+    fn retrieve_checkpoint_range_and_query_are_deterministic() {
+        let range = run_action(DaemonAction::Retrieve(DaemonRetrieveOptions {
+            smoke: DaemonSmokeOptions::default(),
+            kind: "checkpoint".to_string(),
+            id: None,
+            query: None,
+            sequence_start: Some(1),
+            sequence_end: Some(1),
+        }))
+        .expect("retrieve checkpoint range");
+        let range_value: serde_json::Value =
+            serde_json::from_str(&range).expect("parse range json");
+        assert_eq!(
+            range_value["result"]["checkpoints"][0]["id"],
+            "cowork-smoke-checkpoint"
+        );
+        assert_eq!(
+            range_value["result"]["tasks"][0]["id"],
+            "cowork-smoke-connect"
+        );
+
+        let query = run_action(DaemonAction::Retrieve(DaemonRetrieveOptions {
+            smoke: DaemonSmokeOptions::default(),
+            kind: "all".to_string(),
+            id: None,
+            query: Some("protocol".to_string()),
+            sequence_start: None,
+            sequence_end: None,
+        }))
+        .expect("retrieve query");
+        let query_value: serde_json::Value =
+            serde_json::from_str(&query).expect("parse query json");
+        assert_eq!(
+            query_value["result"]["objective"]["id"],
+            "cowork-smoke-objective"
+        );
+        assert_eq!(
+            query_value["result"]["checkpoints"][0]["id"],
+            "cowork-smoke-checkpoint"
+        );
+        assert!(query_value["result"]["resultCount"].as_u64().unwrap() >= 2);
+    }
+
+    #[test]
+    fn retrieve_missing_and_invalid_inputs_have_typed_errors() {
+        let missing = run_action(DaemonAction::Retrieve(DaemonRetrieveOptions {
+            smoke: DaemonSmokeOptions::default(),
+            kind: "evidence".to_string(),
+            id: Some("missing-evidence".to_string()),
+            query: None,
+            sequence_start: None,
+            sequence_end: None,
+        }))
+        .unwrap_err();
+        assert_eq!(missing.code(), "history_record_not_found");
+        assert_eq!(missing.protocol_error().code(), ProtocolErrorCode::NotFound);
+
+        let target = run_action(DaemonAction::Retrieve(DaemonRetrieveOptions {
+            smoke: DaemonSmokeOptions::default(),
+            kind: "turn".to_string(),
+            id: None,
+            query: None,
+            sequence_start: None,
+            sequence_end: None,
+        }))
+        .unwrap_err();
+        assert_eq!(target.code(), "unsupported_retrieval_target");
+        assert_eq!(
+            target.protocol_error().code(),
+            ProtocolErrorCode::InvalidRequest
+        );
+
+        let range = run_action(DaemonAction::Retrieve(DaemonRetrieveOptions {
+            smoke: DaemonSmokeOptions::default(),
+            kind: "checkpoint".to_string(),
+            id: None,
+            query: None,
+            sequence_start: Some(2),
+            sequence_end: Some(1),
+        }))
+        .unwrap_err();
+        assert_eq!(range.code(), "invalid_history_range");
+        assert_eq!(
+            range.protocol_error().code(),
+            ProtocolErrorCode::InvalidRequest
         );
     }
 

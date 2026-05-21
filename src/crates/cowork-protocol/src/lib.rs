@@ -26,7 +26,7 @@ use thiserror::Error;
 pub const PROTOCOL_NAME: &str = "cowork.daemon";
 pub const JSON_RPC_VERSION: &str = "2.0";
 pub const PROTOCOL_VERSION_MAJOR: u16 = 1;
-pub const PROTOCOL_VERSION_MINOR: u16 = 0;
+pub const PROTOCOL_VERSION_MINOR: u16 = 1;
 pub const PROTOCOL_VERSION_PATCH: u16 = 0;
 
 pub type Metadata = BTreeMap<String, serde_json::Value>;
@@ -271,6 +271,61 @@ pub struct CoworkSnapshot {
     pub run_status: RunStatus,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub metadata: Metadata,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryRetrievalRequest {
+    pub target: HistoryRetrievalTarget,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sequence_range: Option<HistorySequenceRange>,
+    pub include_linked: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryRetrievalTarget {
+    All,
+    Objective,
+    Task,
+    Evidence,
+    Checkpoint,
+    Artifact,
+    Subagent,
+    Provider,
+    Browser,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistorySequenceRange {
+    pub start: u64,
+    pub end: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryRetrievalResult {
+    pub request: HistoryRetrievalRequest,
+    pub objective: Option<Objective>,
+    #[serde(default)]
+    pub tasks: Vec<Task>,
+    #[serde(default)]
+    pub evidence: Vec<Evidence>,
+    #[serde(default)]
+    pub checkpoints: Vec<Checkpoint>,
+    #[serde(default)]
+    pub artifacts: Vec<Artifact>,
+    #[serde(default)]
+    pub subagents: Vec<Subagent>,
+    #[serde(default)]
+    pub providers: Vec<Provider>,
+    pub browser: Option<BrowserState>,
+    pub result_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -634,6 +689,39 @@ mod tests {
         assert_eq!(snapshot.providers.len(), 1);
         assert_eq!(snapshot.browser.sessions.len(), 1);
         assert_eq!(snapshot.run_status, RunStatus::Running);
+    }
+
+    #[test]
+    fn history_retrieval_request_and_result_are_protocol_serializable() {
+        let snapshot = fixture_snapshot();
+        let request = HistoryRetrievalRequest {
+            target: HistoryRetrievalTarget::Task,
+            id: Some("task-1".to_string()),
+            query: None,
+            sequence_range: None,
+            include_linked: true,
+        };
+        let result = HistoryRetrievalResult {
+            request: request.clone(),
+            objective: Some(snapshot.objective.clone()),
+            tasks: snapshot.tasks.clone(),
+            evidence: snapshot.evidence.clone(),
+            checkpoints: snapshot.checkpoints.clone(),
+            artifacts: snapshot.artifacts.clone(),
+            subagents: Vec::new(),
+            providers: Vec::new(),
+            browser: None,
+            result_count: 4,
+        };
+
+        let envelope = ProtocolEnvelope::response("history-1", result.clone());
+        let json = serde_json::to_string(&envelope).expect("serialize history envelope");
+        let decoded: ProtocolEnvelope<HistoryRetrievalResult> =
+            serde_json::from_str(&json).expect("deserialize history envelope");
+
+        assert_eq!(decoded.message, ProtocolMessage::Response { result });
+        assert!(json.contains("\"target\":\"task\""));
+        assert!(json.contains("\"includeLinked\":true"));
     }
 
     fn fixture_snapshot() -> CoworkSnapshot {
