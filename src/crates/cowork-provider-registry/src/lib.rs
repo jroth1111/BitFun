@@ -15,6 +15,9 @@ use std::fmt;
 use thiserror::Error;
 
 const REDACTED: &str = "[REDACTED]";
+const PROVIDER_FAMILY_METADATA_KEY: &str = "providerFamily";
+const BASE_URL_METADATA_KEY: &str = "baseUrl";
+const REQUEST_URL_METADATA_KEY: &str = "requestUrl";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -102,6 +105,9 @@ impl CredentialSecret {
         if secret.is_empty() {
             return Err(CredentialVaultError::EmptySecret);
         }
+        if secret.trim().is_empty() || secret.chars().any(char::is_control) {
+            return Err(CredentialVaultError::InvalidSecret);
+        }
         Ok(Self(secret))
     }
 
@@ -127,6 +133,8 @@ pub enum CredentialVaultError {
     InvalidHandle,
     #[error("credential secret is empty")]
     EmptySecret,
+    #[error("credential secret is invalid")]
+    InvalidSecret,
     #[error("credential handle was not found: {handle}")]
     MissingCredential { handle: CredentialHandle },
 }
@@ -192,6 +200,7 @@ pub struct ProviderRegistration {
     pub capabilities: Vec<ProviderCapability>,
     pub credential: ProviderCredentialBinding,
     pub routing: ProviderRoutingMetadata,
+    pub metadata: BTreeMap<String, serde_json::Value>,
 }
 
 impl ProviderRegistration {
@@ -211,12 +220,195 @@ impl ProviderRegistration {
             credential_ref,
             credential_status: self.credential.to_status(),
             routing: self.routing,
+            metadata: self.metadata,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderFamily {
+    OpenAi,
+    Anthropic,
+    Gemini,
+    OpenAiCompatible,
+    OpenRouter,
+    LiteLlm,
+    Ollama,
+}
+
+impl ProviderFamily {
+    pub fn id(self) -> &'static str {
+        match self {
+            ProviderFamily::OpenAi => "openai",
+            ProviderFamily::Anthropic => "anthropic",
+            ProviderFamily::Gemini => "gemini",
+            ProviderFamily::OpenAiCompatible => "openai_compatible",
+            ProviderFamily::OpenRouter => "openrouter",
+            ProviderFamily::LiteLlm => "litellm",
+            ProviderFamily::Ollama => "ollama",
+        }
+    }
+
+    fn default_label(self) -> &'static str {
+        match self {
+            ProviderFamily::OpenAi => "OpenAI",
+            ProviderFamily::Anthropic => "Anthropic",
+            ProviderFamily::Gemini => "Gemini",
+            ProviderFamily::OpenAiCompatible => "OpenAI-compatible endpoint",
+            ProviderFamily::OpenRouter => "OpenRouter",
+            ProviderFamily::LiteLlm => "LiteLLM",
+            ProviderFamily::Ollama => "Ollama local endpoint",
+        }
+    }
+
+    fn kind(self) -> ProviderKind {
+        match self {
+            ProviderFamily::OpenAi
+            | ProviderFamily::Anthropic
+            | ProviderFamily::Gemini
+            | ProviderFamily::OpenRouter => ProviderKind::Byok,
+            ProviderFamily::OpenAiCompatible | ProviderFamily::LiteLlm => {
+                ProviderKind::OpenAiCompatible
+            }
+            ProviderFamily::Ollama => ProviderKind::LocalModel,
+        }
+    }
+
+    fn default_base_url(self) -> Option<&'static str> {
+        match self {
+            ProviderFamily::OpenAi => Some("https://api.openai.com/v1"),
+            ProviderFamily::Anthropic => Some("https://api.anthropic.com"),
+            ProviderFamily::Gemini => Some("https://generativelanguage.googleapis.com"),
+            ProviderFamily::OpenAiCompatible => None,
+            ProviderFamily::OpenRouter => Some("https://openrouter.ai/api/v1"),
+            ProviderFamily::LiteLlm => Some("http://127.0.0.1:4000/v1"),
+            ProviderFamily::Ollama => Some("http://127.0.0.1:11434/v1"),
+        }
+    }
+
+    fn default_capabilities(self) -> Vec<ProviderCapability> {
+        match self {
+            ProviderFamily::OpenAi
+            | ProviderFamily::Anthropic
+            | ProviderFamily::Gemini
+            | ProviderFamily::OpenAiCompatible
+            | ProviderFamily::OpenRouter
+            | ProviderFamily::LiteLlm => vec![
+                ProviderCapability::Text,
+                ProviderCapability::ToolUse,
+                ProviderCapability::FileInput,
+                ProviderCapability::Vision,
+                ProviderCapability::LongContext,
+                ProviderCapability::Streaming,
+            ],
+            ProviderFamily::Ollama => vec![
+                ProviderCapability::Text,
+                ProviderCapability::ToolUse,
+                ProviderCapability::Streaming,
+            ],
+        }
+    }
+
+    fn default_tool_support(self) -> ProviderToolSupport {
+        match self {
+            ProviderFamily::Ollama => ProviderToolSupport {
+                tool_use: true,
+                file_input: false,
+                file_output: false,
+                vision: false,
+                streaming: true,
+            },
+            _ => ProviderToolSupport {
+                tool_use: true,
+                file_input: true,
+                file_output: false,
+                vision: true,
+                streaming: true,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderEndpointConfig {
+    pub id: String,
+    pub family: ProviderFamily,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_url: Option<String>,
+    pub selected_model: String,
+    pub credential: ProviderCredentialBinding,
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub capabilities: Vec<ProviderCapability>,
+    #[serde(default)]
+    pub routing: ProviderRoutingMetadata,
+    #[serde(default)]
+    pub metadata: BTreeMap<String, serde_json::Value>,
+}
+
+impl ProviderEndpointConfig {
+    pub fn byok_api_key(
+        id: impl Into<String>,
+        family: ProviderFamily,
+        selected_model: impl Into<String>,
+        handle: CredentialHandle,
+        label: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            family,
+            label: None,
+            base_url: None,
+            request_url: None,
+            selected_model: selected_model.into(),
+            credential: ProviderCredentialBinding::available(
+                ProviderAuthMethod::ApiKey,
+                handle,
+                label,
+            ),
+            enabled: true,
+            capabilities: Vec::new(),
+            routing: ProviderRoutingMetadata::default(),
+            metadata: BTreeMap::new(),
+        }
+    }
+
+    pub fn local_endpoint(
+        id: impl Into<String>,
+        family: ProviderFamily,
+        selected_model: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            family,
+            label: None,
+            base_url: None,
+            request_url: None,
+            selected_model: selected_model.into(),
+            credential: ProviderCredentialBinding::unavailable(
+                ProviderAuthMethod::LocalEndpoint,
+                ProviderCredentialState::NotRequired,
+            ),
+            enabled: true,
+            capabilities: Vec::new(),
+            routing: ProviderRoutingMetadata::default(),
             metadata: BTreeMap::new(),
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+fn default_enabled() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderCredentialBinding {
     pub method: ProviderAuthMethod,
     pub state: ProviderCredentialState,
@@ -268,6 +460,18 @@ pub enum ProviderRegistryError {
     DuplicateProvider { provider_id: String },
     #[error("provider was not found: {provider_id}")]
     ProviderNotFound { provider_id: String },
+    #[error("provider endpoint is invalid for {provider_id}: {endpoint}")]
+    InvalidProviderEndpoint {
+        provider_id: String,
+        endpoint: String,
+    },
+    #[error("provider credential is missing for {provider_id}")]
+    MissingProviderCredential { provider_id: String },
+    #[error("provider is unavailable for selection: {provider_id} ({status:?})")]
+    ProviderUnavailable {
+        provider_id: String,
+        status: ProviderStatus,
+    },
     #[error("provider capability mismatch for {provider_id}: missing {missing:?}")]
     CapabilityMismatch {
         provider_id: String,
@@ -343,8 +547,42 @@ impl ProviderRegistry {
         Ok(())
     }
 
+    pub fn register_endpoint_config(
+        &mut self,
+        config: ProviderEndpointConfig,
+    ) -> Result<(), ProviderRegistryError> {
+        let registration = endpoint_config_to_registration(config)?;
+        self.register(registration)
+    }
+
     pub fn provider(&self, provider_id: &str) -> Option<&Provider> {
         self.providers.get(provider_id)
+    }
+
+    pub fn select_provider(&self, provider_id: &str) -> Result<&Provider, ProviderRegistryError> {
+        let provider = self.providers.get(provider_id).ok_or_else(|| {
+            ProviderRegistryError::ProviderNotFound {
+                provider_id: provider_id.to_string(),
+            }
+        })?;
+        match provider.status {
+            ProviderStatus::Available => {}
+            status => {
+                return Err(ProviderRegistryError::ProviderUnavailable {
+                    provider_id: provider_id.to_string(),
+                    status,
+                });
+            }
+        }
+        if provider.credential_status.state == ProviderCredentialState::Missing
+            || (provider.credential_status.method == ProviderAuthMethod::ApiKey
+                && provider.credential_status.handle.is_none())
+        {
+            return Err(ProviderRegistryError::MissingProviderCredential {
+                provider_id: provider_id.to_string(),
+            });
+        }
+        Ok(provider)
     }
 
     pub fn snapshot(&self) -> Vec<Provider> {
@@ -395,6 +633,145 @@ impl ProviderRegistry {
                 mismatch,
             })
         }
+    }
+}
+
+pub fn supported_provider_families() -> Vec<ProviderFamily> {
+    vec![
+        ProviderFamily::OpenAi,
+        ProviderFamily::Anthropic,
+        ProviderFamily::Gemini,
+        ProviderFamily::OpenAiCompatible,
+        ProviderFamily::OpenRouter,
+        ProviderFamily::LiteLlm,
+        ProviderFamily::Ollama,
+    ]
+}
+
+fn endpoint_config_to_registration(
+    config: ProviderEndpointConfig,
+) -> Result<ProviderRegistration, ProviderRegistryError> {
+    validate_provider_id(&config.id)?;
+    if config.selected_model.trim().is_empty() {
+        return Err(ProviderRegistryError::InvalidProviderEndpoint {
+            provider_id: config.id,
+            endpoint: "missing selected model".to_string(),
+        });
+    }
+
+    let base_url = config
+        .base_url
+        .clone()
+        .or_else(|| config.family.default_base_url().map(str::to_string))
+        .ok_or_else(|| ProviderRegistryError::InvalidProviderEndpoint {
+            provider_id: config.id.clone(),
+            endpoint: "missing base URL".to_string(),
+        })?;
+    validate_endpoint(&config.id, &base_url)?;
+
+    let request_url = config
+        .request_url
+        .clone()
+        .unwrap_or_else(|| default_request_url(config.family, &base_url, &config.selected_model));
+    validate_endpoint(&config.id, &request_url)?;
+
+    let requires_api_key = config.credential.method == ProviderAuthMethod::ApiKey;
+    if requires_api_key
+        && (config.credential.state != ProviderCredentialState::Available
+            || config.credential.handle.is_none())
+    {
+        return Err(ProviderRegistryError::MissingProviderCredential {
+            provider_id: config.id,
+        });
+    }
+
+    let mut metadata = config.metadata;
+    metadata.insert(
+        PROVIDER_FAMILY_METADATA_KEY.to_string(),
+        serde_json::Value::String(config.family.id().to_string()),
+    );
+    metadata.insert(
+        BASE_URL_METADATA_KEY.to_string(),
+        serde_json::Value::String(base_url),
+    );
+    metadata.insert(
+        REQUEST_URL_METADATA_KEY.to_string(),
+        serde_json::Value::String(request_url),
+    );
+
+    let mut routing = config.routing;
+    if routing.tool_support.is_empty() {
+        routing.tool_support = config.family.default_tool_support();
+    }
+
+    Ok(ProviderRegistration {
+        id: config.id,
+        kind: config.family.kind(),
+        label: config
+            .label
+            .unwrap_or_else(|| config.family.default_label().to_string()),
+        status: if config.enabled {
+            ProviderStatus::Available
+        } else {
+            ProviderStatus::Disabled
+        },
+        selected_model: Some(config.selected_model),
+        capabilities: if config.capabilities.is_empty() {
+            config.family.default_capabilities()
+        } else {
+            config.capabilities
+        },
+        credential: config.credential,
+        routing,
+        metadata,
+    })
+}
+
+fn default_request_url(family: ProviderFamily, base_url: &str, selected_model: &str) -> String {
+    match family {
+        ProviderFamily::OpenAi
+        | ProviderFamily::OpenAiCompatible
+        | ProviderFamily::OpenRouter
+        | ProviderFamily::LiteLlm
+        | ProviderFamily::Ollama => append_endpoint(base_url, "chat/completions"),
+        ProviderFamily::Anthropic => append_endpoint(base_url, "v1/messages"),
+        ProviderFamily::Gemini => append_endpoint(
+            base_url,
+            &format!(
+                "v1beta/models/{}:streamGenerateContent?alt=sse",
+                selected_model.trim()
+            ),
+        ),
+    }
+}
+
+fn append_endpoint(base_url: &str, endpoint: &str) -> String {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    if trimmed.ends_with(endpoint) {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}/{}", endpoint.trim_start_matches('/'))
+    }
+}
+
+fn validate_endpoint(provider_id: &str, endpoint: &str) -> Result<(), ProviderRegistryError> {
+    let trimmed = endpoint.trim();
+    let invalid = trimmed.is_empty()
+        || trimmed.chars().any(char::is_whitespace)
+        || trimmed.chars().any(char::is_control)
+        || !(trimmed.starts_with("https://") || trimmed.starts_with("http://"))
+        || trimmed
+            .split_once("://")
+            .and_then(|(_, rest)| rest.split('/').next())
+            .map(str::is_empty)
+            .unwrap_or(true);
+    if invalid {
+        Err(ProviderRegistryError::InvalidProviderEndpoint {
+            provider_id: provider_id.to_string(),
+            endpoint: REDACTED.to_string(),
+        })
+    } else {
+        Ok(())
     }
 }
 
@@ -530,7 +907,7 @@ mod tests {
     use super::*;
 
     fn synthetic_secret() -> &'static str {
-        "sk-test-cowork-provider-registry-1234567890"
+        "synthetic-secret-cowork-provider-registry-1234567890"
     }
 
     fn registration(handle: CredentialHandle) -> ProviderRegistration {
@@ -572,6 +949,7 @@ mod tests {
                     cached_input_per_million_micros: Some(25_000),
                 },
             ),
+            metadata: BTreeMap::new(),
         }
     }
 
@@ -605,6 +983,14 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn invalid_credential_secret_returns_typed_error_without_echoing_secret() {
+        let error =
+            CredentialSecret::new(" \n\t ").expect_err("blank credential material is invalid");
+        assert_eq!(error, CredentialVaultError::InvalidSecret);
+        assert!(!format!("{error:?}").contains("\\n"));
     }
 
     #[test]
@@ -701,5 +1087,185 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn supported_provider_catalog_covers_required_families() {
+        assert_eq!(
+            supported_provider_families(),
+            vec![
+                ProviderFamily::OpenAi,
+                ProviderFamily::Anthropic,
+                ProviderFamily::Gemini,
+                ProviderFamily::OpenAiCompatible,
+                ProviderFamily::OpenRouter,
+                ProviderFamily::LiteLlm,
+                ProviderFamily::Ollama,
+            ]
+        );
+    }
+
+    #[test]
+    fn every_supported_family_registers_as_configured_provider() {
+        let mut registry = ProviderRegistry::default();
+        for family in supported_provider_families() {
+            let provider_id = format!("{}-provider", family.id());
+            let mut config = if family == ProviderFamily::Ollama {
+                ProviderEndpointConfig::local_endpoint(&provider_id, family, "local-model")
+            } else {
+                ProviderEndpointConfig::byok_api_key(
+                    &provider_id,
+                    family,
+                    "provider-model",
+                    CredentialHandle::for_provider(&provider_id, "api-key")
+                        .expect("provider handle"),
+                    "provider-key",
+                )
+            };
+            if family == ProviderFamily::OpenAiCompatible {
+                config.base_url = Some("https://gateway.example.test/v1".to_string());
+            }
+            registry
+                .register_endpoint_config(config)
+                .expect("family should register as configured provider");
+        }
+
+        let snapshot = registry.snapshot();
+        assert_eq!(snapshot.len(), supported_provider_families().len());
+        for family in supported_provider_families() {
+            let provider_id = format!("{}-provider", family.id());
+            let provider = registry
+                .select_provider(&provider_id)
+                .expect("registered provider should be selectable");
+            assert_eq!(
+                provider.metadata.get(PROVIDER_FAMILY_METADATA_KEY),
+                Some(&serde_json::Value::String(family.id().to_string()))
+            );
+        }
+    }
+
+    #[test]
+    fn daemon_selection_uses_configured_provider_without_secret_leakage() {
+        let handle =
+            CredentialHandle::for_provider("openrouter-main", "api-key").expect("synthetic handle");
+        let mut vault = LocalCredentialVault::memory_only();
+        vault.store(
+            handle.clone(),
+            CredentialSecret::new(synthetic_secret()).expect("synthetic secret"),
+        );
+
+        let mut registry = ProviderRegistry::default();
+        registry
+            .register_endpoint_config(ProviderEndpointConfig::byok_api_key(
+                "openrouter-main",
+                ProviderFamily::OpenRouter,
+                "openrouter/auto",
+                handle,
+                "openrouter-key",
+            ))
+            .expect("provider config should register");
+
+        let provider = registry
+            .select_provider("openrouter-main")
+            .expect("daemon can select provider by id");
+        assert_eq!(provider.kind, ProviderKind::Byok);
+        assert_eq!(provider.status, ProviderStatus::Available);
+        assert_eq!(
+            provider.metadata.get(PROVIDER_FAMILY_METADATA_KEY),
+            Some(&serde_json::Value::String("openrouter".to_string()))
+        );
+        assert_eq!(
+            provider.metadata.get(REQUEST_URL_METADATA_KEY),
+            Some(&serde_json::Value::String(
+                "https://openrouter.ai/api/v1/chat/completions".to_string()
+            ))
+        );
+
+        let evidence_text = serde_json::to_string_pretty(provider).expect("provider serializes");
+        assert!(evidence_text.contains("cowork-vault://providers/openrouter-main/api-key"));
+        assert!(!evidence_text.contains(synthetic_secret()));
+    }
+
+    #[test]
+    fn invalid_endpoint_returns_typed_error_with_redacted_endpoint() {
+        let handle =
+            CredentialHandle::for_provider("bad-provider", "api-key").expect("synthetic handle");
+        let mut config = ProviderEndpointConfig::byok_api_key(
+            "bad-provider",
+            ProviderFamily::OpenAiCompatible,
+            "model",
+            handle,
+            "bad-key",
+        );
+        config.base_url =
+            Some("not a url with synthetic-secret-cowork-provider-registry-1234567890".into());
+
+        let mut registry = ProviderRegistry::default();
+        let error = registry
+            .register_endpoint_config(config)
+            .expect_err("invalid endpoint should be rejected");
+
+        assert!(matches!(
+            error,
+            ProviderRegistryError::InvalidProviderEndpoint {
+                ref provider_id,
+                ref endpoint
+            } if provider_id == "bad-provider" && endpoint == REDACTED
+        ));
+        assert!(!format!("{error:?}").contains(synthetic_secret()));
+    }
+
+    #[test]
+    fn missing_byok_credential_blocks_selection_as_typed_error() {
+        let mut registry = ProviderRegistry::default();
+        let error = registry
+            .register_endpoint_config(ProviderEndpointConfig {
+                id: "openai-missing".to_string(),
+                family: ProviderFamily::OpenAi,
+                label: None,
+                base_url: None,
+                request_url: None,
+                selected_model: "gpt-4.1".to_string(),
+                credential: ProviderCredentialBinding::unavailable(
+                    ProviderAuthMethod::ApiKey,
+                    ProviderCredentialState::Missing,
+                ),
+                enabled: true,
+                capabilities: Vec::new(),
+                routing: ProviderRoutingMetadata::default(),
+                metadata: BTreeMap::new(),
+            })
+            .expect_err("missing BYOK credential should be rejected");
+
+        assert!(matches!(
+            error,
+            ProviderRegistryError::MissingProviderCredential { provider_id }
+                if provider_id == "openai-missing"
+        ));
+    }
+
+    #[test]
+    fn ollama_local_endpoint_can_be_selected_without_api_key() {
+        let mut registry = ProviderRegistry::default();
+        registry
+            .register_endpoint_config(ProviderEndpointConfig::local_endpoint(
+                "ollama-local",
+                ProviderFamily::Ollama,
+                "llama3.2",
+            ))
+            .expect("ollama local provider should not require api key");
+
+        let provider = registry
+            .select_provider("ollama-local")
+            .expect("daemon can select local endpoint");
+        assert_eq!(provider.kind, ProviderKind::LocalModel);
+        assert_eq!(
+            provider.credential_status.method,
+            ProviderAuthMethod::LocalEndpoint
+        );
+        assert_eq!(
+            provider.credential_status.state,
+            ProviderCredentialState::NotRequired
+        );
     }
 }

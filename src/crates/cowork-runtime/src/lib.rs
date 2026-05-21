@@ -862,6 +862,53 @@ where
                 self.block_task_for_provider_requirement(task, &summary, metadata)
                     .map(Some)
             }
+            Err(ProviderRegistryError::InvalidProviderEndpoint {
+                provider_id,
+                endpoint,
+            }) => {
+                let mut metadata = runtime_metadata("provider_endpoint_invalid");
+                metadata.insert(
+                    "providerId".to_string(),
+                    serde_json::Value::String(provider_id.clone()),
+                );
+                metadata.insert("endpoint".to_string(), serde_json::Value::String(endpoint));
+                let summary = format!(
+                    "Provider '{provider_id}' has an invalid endpoint before task assignment."
+                );
+                self.block_task_for_provider_requirement(task, &summary, metadata)
+                    .map(Some)
+            }
+            Err(ProviderRegistryError::MissingProviderCredential { provider_id }) => {
+                let mut metadata = runtime_metadata("provider_credential_missing");
+                metadata.insert(
+                    "providerId".to_string(),
+                    serde_json::Value::String(provider_id.clone()),
+                );
+                let summary = format!(
+                    "Provider '{provider_id}' is missing credentials before task assignment."
+                );
+                self.block_task_for_provider_requirement(task, &summary, metadata)
+                    .map(Some)
+            }
+            Err(ProviderRegistryError::ProviderUnavailable {
+                provider_id,
+                status,
+            }) => {
+                let mut metadata = runtime_metadata("provider_unavailable");
+                metadata.insert(
+                    "providerId".to_string(),
+                    serde_json::Value::String(provider_id.clone()),
+                );
+                metadata.insert(
+                    "status".to_string(),
+                    serde_json::to_value(status).expect("provider status serializes"),
+                );
+                let summary = format!(
+                    "Provider '{provider_id}' is unavailable before task assignment ({status:?})."
+                );
+                self.block_task_for_provider_requirement(task, &summary, metadata)
+                    .map(Some)
+            }
             Err(ProviderRegistryError::InvalidProviderId) => {
                 let summary =
                     "Provider registry contains an invalid provider id before task assignment.";
@@ -2020,6 +2067,7 @@ mod tests {
                         cached_input_per_million_micros: Some(25_000),
                     },
                 ),
+                metadata: Metadata::new(),
             })
             .expect("register runtime provider");
         registry
