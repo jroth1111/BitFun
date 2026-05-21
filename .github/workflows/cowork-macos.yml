@@ -25,7 +25,7 @@ jobs:
     env:
       CARGO_TARGET_DIR: target/cowork-smoke/cargo-target
       CARGO_TERM_COLOR: always
-      TMPDIR: ${{ runner.temp }}/cowork-smoke-tmp
+      TMPDIR: target/cowork-smoke/tmp
     steps:
       - uses: actions/checkout@v4
 
