@@ -25,7 +25,6 @@ jobs:
     env:
       CARGO_TARGET_DIR: target/cowork-smoke/cargo-target
       CARGO_TERM_COLOR: always
-      TMPDIR: target/cowork-smoke/tmp
     steps:
       - uses: actions/checkout@v4
 
@@ -37,7 +36,10 @@ jobs:
           cache-bin: false
 
       - name: Run Cowork smoke
-        run: bash scripts/cowork-smoke.sh
+        run: |
+          export TMPDIR="${GITHUB_WORKSPACE}/target/cowork-smoke/tmp"
+          mkdir -p "${TMPDIR}"
+          bash scripts/cowork-smoke.sh
 
   windows-future:
     name: Cowork Windows CI (future stub)
