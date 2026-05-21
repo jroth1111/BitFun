@@ -10,6 +10,7 @@ mod agent;
 mod chat_state;
 mod commands;
 mod config;
+mod cowork_daemon;
 mod modes;
 mod prompts;
 mod ui;
@@ -114,6 +115,12 @@ enum Commands {
     Acp {
         #[command(subcommand)]
         action: Option<AcpAction>,
+    },
+
+    /// Start or inspect the Cowork daemon smoke boundary
+    Daemon {
+        #[command(subcommand)]
+        action: cowork_daemon::DaemonAction,
     },
 }
 
@@ -434,6 +441,7 @@ async fn main() -> Result<()> {
 
     let is_tui_mode = matches!(cli.command, None | Some(Commands::Chat { .. }));
     let is_acp_command = matches!(cli.command, Some(Commands::Acp { .. }));
+    let is_daemon_command = matches!(cli.command, Some(Commands::Daemon { .. }));
     let is_acp_serve = matches!(
         cli.command,
         Some(Commands::Acp { action: None })
@@ -445,7 +453,7 @@ async fn main() -> Result<()> {
         tracing::Level::DEBUG
     } else if is_acp_serve {
         tracing::Level::WARN
-    } else if is_acp_command {
+    } else if is_acp_command || is_daemon_command {
         tracing::Level::ERROR
     } else {
         tracing::Level::INFO
@@ -475,7 +483,7 @@ async fn main() -> Result<()> {
                 .with_target(false)
                 .init();
         }
-    } else if is_acp_command {
+    } else if is_acp_command || is_daemon_command {
         tracing_subscriber::fmt()
             .with_max_level(log_level)
             .with_writer(std::io::stderr)
@@ -625,6 +633,14 @@ async fn main() -> Result<()> {
         }) => {
             acp_cli::run_external_client(client, prompt, workspace, timeout, permission).await?;
         }
+
+        Some(Commands::Daemon { action }) => match cowork_daemon::run_action(action) {
+            Ok(output) => println!("{output}"),
+            Err(error) => {
+                eprintln!("{}", cowork_daemon::render_error(&error));
+                std::process::exit(1);
+            }
+        },
 
         None => {
             // Default: interactive TUI with startup page
