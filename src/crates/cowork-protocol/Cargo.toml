@@ -1,0 +1,15 @@
+[package]
+name = "cowork-protocol"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+description = "Cowork daemon protocol DTOs and version compatibility policy"
+
+[lib]
+name = "cowork_protocol"
+crate-type = ["rlib"]
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
