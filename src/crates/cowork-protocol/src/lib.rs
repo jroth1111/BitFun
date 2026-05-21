@@ -26,7 +26,7 @@ use thiserror::Error;
 pub const PROTOCOL_NAME: &str = "cowork.daemon";
 pub const JSON_RPC_VERSION: &str = "2.0";
 pub const PROTOCOL_VERSION_MAJOR: u16 = 1;
-pub const PROTOCOL_VERSION_MINOR: u16 = 1;
+pub const PROTOCOL_VERSION_MINOR: u16 = 2;
 pub const PROTOCOL_VERSION_PATCH: u16 = 0;
 
 pub type Metadata = BTreeMap<String, serde_json::Value>;
@@ -264,6 +264,8 @@ pub struct CoworkSnapshot {
     #[serde(default)]
     pub artifacts: Vec<Artifact>,
     #[serde(default)]
+    pub subagent_registry: SubagentRegistry,
+    #[serde(default)]
     pub subagents: Vec<Subagent>,
     #[serde(default)]
     pub providers: Vec<Provider>,
@@ -493,6 +495,222 @@ pub struct Subagent {
     pub denied_tools: Vec<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub metadata: Metadata,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubagentRegistry {
+    #[serde(default)]
+    pub definitions: Vec<SubagentDefinition>,
+}
+
+impl SubagentRegistry {
+    pub fn validate(&self) -> Result<(), SubagentRegistryError> {
+        let mut ids = BTreeMap::<&str, ()>::new();
+        for definition in &self.definitions {
+            definition.validate()?;
+            if ids.insert(definition.id.as_str(), ()).is_some() {
+                return Err(SubagentRegistryError::DuplicateDefinitionId {
+                    id: definition.id.clone(),
+                });
+            }
+        }
+
+        for definition in &self.definitions {
+            if let Some(parent_id) = &definition.parent_subagent_id {
+                if parent_id == &definition.id {
+                    return Err(SubagentRegistryError::InvalidParentSubagent {
+                        id: definition.id.clone(),
+                        parent_id: parent_id.clone(),
+                        reason: "definition cannot name itself as parent".to_string(),
+                    });
+                }
+                if !ids.contains_key(parent_id.as_str()) {
+                    return Err(SubagentRegistryError::InvalidParentSubagent {
+                        id: definition.id.clone(),
+                        parent_id: parent_id.clone(),
+                        reason: "parent subagent definition is not registered".to_string(),
+                    });
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubagentDefinition {
+    pub id: String,
+    pub name: String,
+    pub role: String,
+    pub prompt: String,
+    pub model: String,
+    pub budget: SubagentBudget,
+    pub workspace: SubagentWorkspace,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_task_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_subagent_id: Option<String>,
+    pub lifecycle_state: SubagentLifecycleState,
+    #[serde(default)]
+    pub tool_allowlist: Vec<String>,
+    #[serde(default)]
+    pub tool_denylist: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: Metadata,
+}
+
+impl SubagentDefinition {
+    pub fn validate(&self) -> Result<(), SubagentRegistryError> {
+        require_non_empty("id", &self.id)?;
+        require_non_empty("name", &self.name)?;
+        require_non_empty("role", &self.role)?;
+        require_non_empty("prompt", &self.prompt)?;
+        require_clean_token("model", &self.model)?;
+        self.budget.validate()?;
+        self.workspace.validate()?;
+        if let Some(parent_task_id) = &self.parent_task_id {
+            require_non_empty("parentTaskId", parent_task_id)?;
+        }
+        validate_tool_set("toolAllowlist", &self.tool_allowlist)?;
+        validate_tool_set("toolDenylist", &self.tool_denylist)?;
+        for tool in &self.tool_allowlist {
+            if self.tool_denylist.iter().any(|denied| denied == tool) {
+                return Err(SubagentRegistryError::ToolPolicyConflict { tool: tool.clone() });
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentLifecycleState {
+    Defined,
+    Scheduled,
+    Running,
+    WaitingForReport,
+    Reported,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubagentBudget {
+    pub max_turns: u32,
+    pub max_tool_calls: u32,
+    pub max_output_tokens: u32,
+}
+
+impl SubagentBudget {
+    pub const fn new(max_turns: u32, max_tool_calls: u32, max_output_tokens: u32) -> Self {
+        Self {
+            max_turns,
+            max_tool_calls,
+            max_output_tokens,
+        }
+    }
+
+    fn validate(&self) -> Result<(), SubagentRegistryError> {
+        if self.max_turns == 0 || self.max_tool_calls == 0 || self.max_output_tokens == 0 {
+            return Err(SubagentRegistryError::InvalidBudget {
+                reason: "budget limits must be positive".to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubagentWorkspace {
+    pub root_id: String,
+    pub uri: String,
+}
+
+impl SubagentWorkspace {
+    pub fn new(root_id: impl Into<String>, uri: impl Into<String>) -> Self {
+        Self {
+            root_id: root_id.into(),
+            uri: uri.into(),
+        }
+    }
+
+    fn validate(&self) -> Result<(), SubagentRegistryError> {
+        require_non_empty("workspace.rootId", &self.root_id)?;
+        require_non_empty("workspace.uri", &self.uri)?;
+        if !self.uri.starts_with("workspace://") {
+            return Err(SubagentRegistryError::InvalidWorkspace {
+                uri: self.uri.clone(),
+                reason: "workspace uri must start with workspace://".to_string(),
+            });
+        }
+        if self.uri.contains("..") {
+            return Err(SubagentRegistryError::InvalidWorkspace {
+                uri: self.uri.clone(),
+                reason: "workspace uri must not contain traversal segments".to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum SubagentRegistryError {
+    #[error("subagent definition field '{field}' cannot be empty")]
+    EmptyField { field: &'static str },
+    #[error("subagent definition field '{field}' contains an invalid token '{value}'")]
+    InvalidToken { field: &'static str, value: String },
+    #[error("duplicate subagent definition id '{id}'")]
+    DuplicateDefinitionId { id: String },
+    #[error("invalid subagent workspace '{uri}': {reason}")]
+    InvalidWorkspace { uri: String, reason: String },
+    #[error("invalid subagent budget: {reason}")]
+    InvalidBudget { reason: String },
+    #[error("invalid parent subagent for '{id}' -> '{parent_id}': {reason}")]
+    InvalidParentSubagent {
+        id: String,
+        parent_id: String,
+        reason: String,
+    },
+    #[error("invalid subagent tool policy entry in '{field}': '{tool}'")]
+    InvalidToolPolicyEntry { field: &'static str, tool: String },
+    #[error("subagent tool '{tool}' appears in both allowlist and denylist")]
+    ToolPolicyConflict { tool: String },
+}
+
+fn require_non_empty(field: &'static str, value: &str) -> Result<(), SubagentRegistryError> {
+    if value.trim().is_empty() {
+        return Err(SubagentRegistryError::EmptyField { field });
+    }
+    Ok(())
+}
+
+fn require_clean_token(field: &'static str, value: &str) -> Result<(), SubagentRegistryError> {
+    require_non_empty(field, value)?;
+    if value.chars().any(char::is_control) {
+        return Err(SubagentRegistryError::InvalidToken {
+            field,
+            value: value.to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_tool_set(field: &'static str, tools: &[String]) -> Result<(), SubagentRegistryError> {
+    for tool in tools {
+        require_non_empty(field, tool)?;
+        if tool.chars().any(char::is_whitespace) || tool.chars().any(char::is_control) {
+            return Err(SubagentRegistryError::InvalidToolPolicyEntry {
+                field,
+                tool: tool.clone(),
+            });
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -789,6 +1007,7 @@ mod tests {
                 },
                 metadata: Metadata::new(),
             }],
+            subagent_registry: fixture_subagent_registry(&subagent_id, &task_id),
             subagents: vec![Subagent {
                 id: subagent_id,
                 name: "researcher".to_string(),
@@ -831,5 +1050,115 @@ mod tests {
             run_status: RunStatus::Running,
             metadata: Metadata::new(),
         }
+    }
+
+    fn fixture_subagent_registry(subagent_id: &str, task_id: &str) -> SubagentRegistry {
+        SubagentRegistry {
+            definitions: vec![SubagentDefinition {
+                id: subagent_id.to_string(),
+                name: "researcher".to_string(),
+                role: "Collect source material".to_string(),
+                prompt: "Find source-backed evidence and report with citations.".to_string(),
+                model: "cowork-model".to_string(),
+                budget: SubagentBudget::new(8, 24, 32_000),
+                workspace: SubagentWorkspace::new("project", "workspace://project"),
+                parent_task_id: Some(task_id.to_string()),
+                parent_subagent_id: None,
+                lifecycle_state: SubagentLifecycleState::Running,
+                tool_allowlist: vec!["browser".to_string(), "session_history.read".to_string()],
+                tool_denylist: vec!["shell.exec".to_string()],
+                metadata: Metadata::new(),
+            }],
+        }
+    }
+
+    #[test]
+    fn subagent_registry_validates_definition_graph() {
+        let registry = SubagentRegistry {
+            definitions: vec![
+                SubagentDefinition {
+                    id: "subagent-parent".to_string(),
+                    name: "planner".to_string(),
+                    role: "Plan worker execution".to_string(),
+                    prompt: "Plan the delegated work.".to_string(),
+                    model: "cowork-model".to_string(),
+                    budget: SubagentBudget::new(4, 8, 8_000),
+                    workspace: SubagentWorkspace::new("project", "workspace://project"),
+                    parent_task_id: Some("task-1".to_string()),
+                    parent_subagent_id: None,
+                    lifecycle_state: SubagentLifecycleState::Defined,
+                    tool_allowlist: vec!["session_history.read".to_string()],
+                    tool_denylist: vec!["shell.exec".to_string()],
+                    metadata: Metadata::new(),
+                },
+                SubagentDefinition {
+                    id: "subagent-child".to_string(),
+                    name: "implementer".to_string(),
+                    role: "Implement scoped changes".to_string(),
+                    prompt: "Implement only the assigned write scope.".to_string(),
+                    model: "cowork-model".to_string(),
+                    budget: SubagentBudget::new(8, 24, 32_000),
+                    workspace: SubagentWorkspace::new("project", "workspace://project/src"),
+                    parent_task_id: Some("task-1".to_string()),
+                    parent_subagent_id: Some("subagent-parent".to_string()),
+                    lifecycle_state: SubagentLifecycleState::Scheduled,
+                    tool_allowlist: vec![
+                        "workspace.read".to_string(),
+                        "workspace.write".to_string(),
+                    ],
+                    tool_denylist: vec!["git.push".to_string()],
+                    metadata: Metadata::new(),
+                },
+            ],
+        };
+
+        registry.validate().expect("valid subagent registry");
+    }
+
+    #[test]
+    fn subagent_registry_rejects_invalid_model_workspace_tools_budget_and_parents() {
+        let mut invalid = fixture_subagent_registry("subagent-1", "task-1");
+        invalid.definitions[0].model = "\n".to_string();
+        assert!(matches!(
+            invalid.validate(),
+            Err(SubagentRegistryError::EmptyField { field: "model" })
+        ));
+
+        let mut invalid = fixture_subagent_registry("subagent-1", "task-1");
+        invalid.definitions[0].workspace.uri = "file:///tmp/project".to_string();
+        assert!(matches!(
+            invalid.validate(),
+            Err(SubagentRegistryError::InvalidWorkspace { .. })
+        ));
+
+        let mut invalid = fixture_subagent_registry("subagent-1", "task-1");
+        invalid.definitions[0]
+            .tool_denylist
+            .push("browser".to_string());
+        assert!(matches!(
+            invalid.validate(),
+            Err(SubagentRegistryError::ToolPolicyConflict { tool }) if tool == "browser"
+        ));
+
+        let mut invalid = fixture_subagent_registry("subagent-1", "task-1");
+        invalid.definitions[0].budget.max_turns = 0;
+        assert!(matches!(
+            invalid.validate(),
+            Err(SubagentRegistryError::InvalidBudget { .. })
+        ));
+
+        let mut invalid = fixture_subagent_registry("subagent-1", "task-1");
+        invalid.definitions.push(invalid.definitions[0].clone());
+        assert!(matches!(
+            invalid.validate(),
+            Err(SubagentRegistryError::DuplicateDefinitionId { .. })
+        ));
+
+        let mut invalid = fixture_subagent_registry("subagent-1", "task-1");
+        invalid.definitions[0].parent_subagent_id = Some("missing-parent".to_string());
+        assert!(matches!(
+            invalid.validate(),
+            Err(SubagentRegistryError::InvalidParentSubagent { .. })
+        ));
     }
 }

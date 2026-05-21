@@ -5,7 +5,8 @@ use cowork_protocol::{
     HistoryRetrievalRequest, HistoryRetrievalResult, HistoryRetrievalTarget, HistorySequenceRange,
     Metadata, Objective, ObjectiveStatus, ProtocolEnvelope, ProtocolError, ProtocolErrorCode,
     ProtocolVersion, Provider, ProviderCapability, ProviderKind, ProviderStatus, RunStatus,
-    Subagent, SubagentStatus, Task, TaskStatus,
+    Subagent, SubagentBudget, SubagentDefinition, SubagentLifecycleState, SubagentRegistry,
+    SubagentStatus, SubagentWorkspace, Task, TaskStatus,
 };
 use serde::Serialize;
 use std::error::Error;
@@ -1149,6 +1150,28 @@ impl LocalSmokeDaemon {
                 },
                 metadata: self.metadata(),
             }],
+            subagent_registry: SubagentRegistry {
+                definitions: vec![SubagentDefinition {
+                    id: subagent_id.clone(),
+                    name: "smoke-worker".to_string(),
+                    role: "Exercise the deterministic daemon export boundary.".to_string(),
+                    prompt: "Return smoke daemon status, export, and retrieval evidence."
+                        .to_string(),
+                    model: "cowork-smoke-model".to_string(),
+                    budget: SubagentBudget::new(4, 8, 8_000),
+                    workspace: SubagentWorkspace::new("project", "workspace://project"),
+                    parent_task_id: Some(task_id.clone()),
+                    parent_subagent_id: None,
+                    lifecycle_state: SubagentLifecycleState::Running,
+                    tool_allowlist: vec![
+                        "daemon.status".to_string(),
+                        "daemon.export".to_string(),
+                        "daemon.retrieve".to_string(),
+                    ],
+                    tool_denylist: Vec::new(),
+                    metadata: self.metadata(),
+                }],
+            },
             subagents: vec![Subagent {
                 id: subagent_id.clone(),
                 name: "smoke-worker".to_string(),
@@ -1416,6 +1439,12 @@ mod tests {
             AuthorityInvariant::daemon_authoritative()
         );
         assert_eq!(connection.snapshot.objective.id, "cowork-smoke-objective");
+        assert_eq!(connection.snapshot.subagent_registry.definitions.len(), 1);
+        connection
+            .snapshot
+            .subagent_registry
+            .validate()
+            .expect("smoke subagent registry validates");
         assert_eq!(connection.snapshot.subagents.len(), 1);
         assert_eq!(connection.snapshot.providers.len(), 1);
         assert_eq!(connection.snapshot.browser.sessions.len(), 1);
@@ -1460,6 +1489,14 @@ mod tests {
             serde_json::from_str(&export_json).expect("parse export json");
         assert_eq!(export_value["runStatus"], "running");
         assert_eq!(export_value["protocolVersion"]["major"], 1);
+        assert_eq!(
+            export_value["subagentRegistry"]["definitions"][0]["id"],
+            "cowork-smoke-worker"
+        );
+        assert_eq!(
+            export_value["subagentRegistry"]["definitions"][0]["workspace"]["uri"],
+            "workspace://project"
+        );
         assert_eq!(export_value["subagents"][0]["id"], "cowork-smoke-worker");
         assert_eq!(export_value["providers"][0]["id"], "cowork-smoke-provider");
         assert_eq!(
