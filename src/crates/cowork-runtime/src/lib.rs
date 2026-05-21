@@ -552,10 +552,8 @@ where
         attempt: u32,
         result: ToolResult,
     ) -> Result<EvidenceId, LedgerError> {
-        let evidence_id = EvidenceId::parse(format!(
-            "evidence/runtime-turn-{}-attempt-{}",
-            self.turns, attempt
-        ))?;
+        let evidence_id =
+            self.next_evidence_id(format!("runtime-turn-{}-attempt-{}", self.turns, attempt))?;
         let summary = result
             .evidence_summary
             .unwrap_or_else(|| "Tool returned no evidence.".to_string());
@@ -660,7 +658,7 @@ where
         task_id: &TaskId,
         report: &SubmitReport,
     ) -> Result<EvidenceId, LedgerError> {
-        let evidence_id = EvidenceId::parse(format!("evidence/submit-report-{}", self.turns))?;
+        let evidence_id = self.next_evidence_id(format!("submit-report-{}", self.turns))?;
         self.ledger
             .apply_update(LedgerUpdate::RecordEvidence(Evidence {
                 id: evidence_id.clone(),
@@ -743,6 +741,7 @@ where
                 stop_reason_id: None,
             });
         };
+        self.selected_task_id.get_or_insert_with(|| task.id.clone());
         self.stop_task(&task.id, kind, status, stop_kind, summary)
     }
 
@@ -793,8 +792,8 @@ where
         status: TaskStatus,
         summary: &str,
     ) -> Result<EvidenceId, LedgerError> {
-        let evidence_id = EvidenceId::parse(format!(
-            "evidence/runtime-cleanup-{}-{}",
+        let evidence_id = self.next_evidence_id(format!(
+            "runtime-cleanup-{}-{}",
             self.turns,
             runtime_stop_slug(stop_kind)
         ))?;
@@ -830,6 +829,21 @@ where
                 metadata,
             }))?;
         Ok(evidence_id)
+    }
+
+    fn next_evidence_id(&self, base: String) -> Result<EvidenceId, LedgerError> {
+        let first = EvidenceId::parse(format!("evidence/{base}"))?;
+        if !self.ledger.evidence().contains_key(&first) {
+            return Ok(first);
+        }
+
+        for suffix in 2.. {
+            let candidate = EvidenceId::parse(format!("evidence/{base}-{suffix}"))?;
+            if !self.ledger.evidence().contains_key(&candidate) {
+                return Ok(candidate);
+            }
+        }
+        unreachable!("unbounded suffix search returns once an evidence id is free")
     }
 
     fn stop_objective(
@@ -1077,6 +1091,14 @@ mod tests {
         TaskId::parse("task/runtime-test").expect("task id")
     }
 
+    fn parent_task_id() -> TaskId {
+        TaskId::parse("task/runtime-parent").expect("parent task id")
+    }
+
+    fn child_task_id() -> TaskId {
+        TaskId::parse("task/runtime-child").expect("child task id")
+    }
+
     fn evidence_id() -> EvidenceId {
         EvidenceId::parse("evidence/subagent-acceptance").expect("evidence id")
     }
@@ -1097,8 +1119,8 @@ mod tests {
         ledger_with_task_metadata(status, Metadata::new())
     }
 
-    fn ledger_with_task_metadata(status: TaskStatus, metadata: Metadata) -> CoworkLedger {
-        let mut ledger = CoworkLedger::initialize(LedgerInitialization {
+    fn base_ledger() -> CoworkLedger {
+        CoworkLedger::initialize(LedgerInitialization {
             root_objective_id: objective_id(),
             root_objective_text: "Prove the autonomous objective loop.".to_string(),
             acceptance_criteria: vec!["A model message without evidence cannot close.".to_string()],
@@ -1113,13 +1135,21 @@ mod tests {
             initialized_by: actor(),
             metadata: Metadata::new(),
         })
-        .expect("initialize ledger");
+        .expect("initialize ledger")
+    }
 
+    fn register_task(
+        ledger: &mut CoworkLedger,
+        id: TaskId,
+        title: impl Into<String>,
+        status: TaskStatus,
+        metadata: Metadata,
+    ) {
         ledger
             .apply_update(LedgerUpdate::RegisterTask(Task {
-                id: task_id(),
+                id,
                 objective_id: objective_id(),
-                title: "Run synthetic objective task".to_string(),
+                title: title.into(),
                 description: None,
                 status,
                 status_updated_at: Utc::now(),
@@ -1131,6 +1161,40 @@ mod tests {
                 metadata,
             }))
             .expect("register task");
+    }
+
+    fn ledger_with_task_metadata(status: TaskStatus, metadata: Metadata) -> CoworkLedger {
+        let mut ledger = base_ledger();
+        register_task(
+            &mut ledger,
+            task_id(),
+            "Run synthetic objective task",
+            status,
+            metadata,
+        );
+        ledger
+    }
+
+    fn ledger_with_parent_and_child(
+        parent_status: TaskStatus,
+        child_status: TaskStatus,
+        child_metadata: Metadata,
+    ) -> CoworkLedger {
+        let mut ledger = base_ledger();
+        register_task(
+            &mut ledger,
+            child_task_id(),
+            "Run delegated child task",
+            child_status,
+            child_metadata,
+        );
+        register_task(
+            &mut ledger,
+            parent_task_id(),
+            "Recover parent task",
+            parent_status,
+            Metadata::new(),
+        );
         ledger
     }
 
@@ -1646,5 +1710,215 @@ mod tests {
             report_evidence.metadata.get("reportedBlockerIds"),
             Some(&serde_json::json!(["blocker/subagent-input"]))
         );
+    }
+
+    #[test]
+    fn subagent_failure_suite_forced_child_tool_failure_records_cleanup_and_parent_recovers() {
+        let mut child_metadata = Metadata::new();
+        child_metadata.insert(
+            "parentTaskId".to_string(),
+            serde_json::Value::String(parent_task_id().to_string()),
+        );
+        let (ledger, report) = CoworkRuntime::new(
+            ledger_with_parent_and_child(
+                TaskStatus::InProgress,
+                TaskStatus::NotStarted,
+                child_metadata,
+            ),
+            SequenceDriver::new(vec![ToolResult::failed("child tool failed").into()]),
+            RuntimeOptions {
+                max_repair_attempts: 0,
+                ..RuntimeOptions::default()
+            },
+            actor(),
+        )
+        .run()
+        .expect("child failure run");
+
+        assert_eq!(report.stop.kind, RuntimeStopKind::Failed);
+        assert_eq!(
+            report.selected_task_id.as_deref(),
+            Some("task/runtime-child")
+        );
+        assert_eq!(report.cleanup_records, 1);
+        assert_eq!(
+            ledger.tasks().get(&child_task_id()).unwrap().status,
+            TaskStatus::Failed
+        );
+        assert_eq!(
+            ledger.tasks().get(&parent_task_id()).unwrap().status,
+            TaskStatus::InProgress
+        );
+
+        let (ledger, recovery_report) = CoworkRuntime::new(
+            ledger,
+            SequenceDriver::new(vec![ToolResult::passed("parent recovery passed").into()]),
+            RuntimeOptions::default(),
+            actor(),
+        )
+        .run()
+        .expect("parent recovery run");
+
+        assert_eq!(recovery_report.stop.kind, RuntimeStopKind::NoReadyTask);
+        assert_eq!(
+            recovery_report.selected_task_id.as_deref(),
+            Some("task/runtime-parent")
+        );
+        assert_eq!(
+            ledger.tasks().get(&parent_task_id()).unwrap().status,
+            TaskStatus::Verified
+        );
+    }
+
+    #[test]
+    fn subagent_failure_suite_cancellation_while_child_running_records_cleanup_and_parent_recovers()
+    {
+        let mut child_metadata = Metadata::new();
+        child_metadata.insert(
+            "parentTaskId".to_string(),
+            serde_json::Value::String(parent_task_id().to_string()),
+        );
+        let mut runtime = CoworkRuntime::new(
+            ledger_with_parent_and_child(
+                TaskStatus::InProgress,
+                TaskStatus::InProgress,
+                child_metadata,
+            ),
+            SequenceDriver::new(vec![ToolResult::passed("should not run").into()]),
+            RuntimeOptions::default(),
+            actor(),
+        );
+        runtime.request_cancel();
+
+        let (ledger, cancel_report) = runtime.run().expect("child cancellation run");
+
+        assert_eq!(cancel_report.stop.kind, RuntimeStopKind::Cancelled);
+        assert_eq!(cancel_report.tool_calls, 0);
+        assert_eq!(
+            cancel_report.selected_task_id.as_deref(),
+            Some("task/runtime-child")
+        );
+        assert_eq!(
+            ledger.tasks().get(&child_task_id()).unwrap().status,
+            TaskStatus::Cancelled
+        );
+        assert_eq!(
+            ledger.tasks().get(&parent_task_id()).unwrap().status,
+            TaskStatus::InProgress
+        );
+        let cleanup = cleanup_evidence(&ledger);
+        assert_eq!(cleanup.len(), 1);
+        assert_eq!(
+            cleanup[0].metadata.get("parentCancellationPropagated"),
+            Some(&serde_json::json!(true))
+        );
+
+        let (ledger, recovery_report) = CoworkRuntime::new(
+            ledger,
+            SequenceDriver::new(vec![ToolResult::passed("parent recovery passed").into()]),
+            RuntimeOptions::default(),
+            actor(),
+        )
+        .run()
+        .expect("parent recovery run");
+
+        assert_eq!(recovery_report.stop.kind, RuntimeStopKind::NoReadyTask);
+        assert_eq!(
+            recovery_report.selected_task_id.as_deref(),
+            Some("task/runtime-parent")
+        );
+        assert_eq!(
+            ledger.tasks().get(&parent_task_id()).unwrap().status,
+            TaskStatus::Verified
+        );
+    }
+
+    #[test]
+    fn subagent_failure_suite_empty_report_is_rejected_without_subagent_report_evidence() {
+        let report_result = SubmitReport::new(
+            SubmitReportStatus::Failed,
+            "",
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            10,
+        );
+        let (ledger, report) = run_with(vec![report_result.into()]);
+
+        assert_eq!(report.stop.kind, RuntimeStopKind::SubmitReportRejected);
+        assert_eq!(report.final_task_status, Some(TaskStatus::Failed));
+        assert_eq!(report.cleanup_records, 1);
+        assert!(ledger
+            .evidence()
+            .values()
+            .all(|evidence| evidence.kind != EvidenceKind::SubagentReport));
+    }
+
+    #[test]
+    fn subagent_failure_suite_malformed_report_is_rejected_without_verifying_child() {
+        let mut ledger = ledger_with_task(TaskStatus::NotStarted);
+        record_passed_evidence(&mut ledger);
+        let report_result = SubmitReport::new(
+            SubmitReportStatus::Verified,
+            "Subagent cites the same evidence twice.",
+            vec![evidence_id(), evidence_id()],
+            Vec::new(),
+            Vec::new(),
+            90,
+        );
+        let (ledger, report) = CoworkRuntime::new(
+            ledger,
+            SequenceDriver::new(vec![report_result.into()]),
+            RuntimeOptions::default(),
+            actor(),
+        )
+        .run()
+        .expect("malformed report run");
+
+        assert_eq!(report.stop.kind, RuntimeStopKind::SubmitReportRejected);
+        assert_eq!(report.final_task_status, Some(TaskStatus::Failed));
+        assert_ne!(
+            ledger.tasks().get(&task_id()).unwrap().status,
+            TaskStatus::Verified
+        );
+        assert!(ledger
+            .evidence()
+            .values()
+            .all(|evidence| evidence.kind != EvidenceKind::SubagentReport));
+    }
+
+    #[test]
+    fn subagent_failure_suite_loop_guards_stop_nested_and_repeated_delegation_before_tools() {
+        for (key, value, stop_summary) in [
+            ("delegationDepth", 5, "Delegation depth 5"),
+            (
+                "delegationRepeatCount",
+                3,
+                "Repeated child delegation count 3",
+            ),
+        ] {
+            let mut metadata = Metadata::new();
+            metadata.insert(key.to_string(), serde_json::json!(value));
+            let (ledger, report) = CoworkRuntime::new(
+                ledger_with_task_metadata(TaskStatus::NotStarted, metadata),
+                SequenceDriver::new(vec![ToolResult::passed("should not run").into()]),
+                RuntimeOptions {
+                    max_delegation_depth: 4,
+                    max_repeated_child_delegations: 2,
+                    ..RuntimeOptions::default()
+                },
+                actor(),
+            )
+            .run()
+            .expect("delegation guard run");
+
+            assert_eq!(report.stop.kind, RuntimeStopKind::DelegationLoopGuard);
+            assert_eq!(report.tool_calls, 0);
+            assert_eq!(report.final_task_status, Some(TaskStatus::Failed));
+            assert_eq!(report.cleanup_records, 1);
+            assert!(ledger.stop_reasons().values().any(|reason| {
+                reason.kind == StopReasonKind::Failed && reason.summary.contains(stop_summary)
+            }));
+        }
     }
 }
