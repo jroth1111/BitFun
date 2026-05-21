@@ -1,16 +1,16 @@
 [package]
-name = "cowork-plugin-registry"
+name = "cowork-governance"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
-description = "Cowork kernel-owned plugin manifest and capability registry"
+description = "Cowork platform-agnostic governance, permission, approval, and audit model"
 
 [lib]
-name = "cowork_plugin_registry"
+name = "cowork_governance"
 crate-type = ["rlib"]
 
 [dependencies]
-cowork-governance = { path = "../cowork-governance" }
+regex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

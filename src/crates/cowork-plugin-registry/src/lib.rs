@@ -4,6 +4,12 @@
 //! intentionally does not execute plugins, load processes, touch the network,
 //! or integrate with GUI/CLI/daemon runtime code.
 
+use cowork_governance::{
+    ActionKind, ActionRequest, ActionRisk, ActorRole, ActorSelector, ActorStatus, ApprovalRecord,
+    DecisionOutcome, EvidenceBundle, GateKind, GateRequirements, GovernanceActor,
+    GovernanceAuditExport, GovernanceManager, PolicyRule, Resource, ResourceKind, ResourceSelector,
+    ScopePattern,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
@@ -315,6 +321,21 @@ pub struct ExecutionPermit {
     pub capability_id: String,
     pub capability_kind: CapabilityKind,
     pub granted_permissions: BTreeSet<Permission>,
+    #[serde(default)]
+    pub governance_decision_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreExecutionContext {
+    #[serde(default)]
+    pub permission_approvals: BTreeMap<Permission, String>,
+    #[serde(default)]
+    pub evidence: EvidenceBundle,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub justification: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: Metadata,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -328,6 +349,7 @@ pub struct RegistrySnapshot {
 pub struct PluginRegistry {
     plugins: BTreeMap<String, RegisteredPlugin>,
     enabled_capabilities: BTreeMap<String, String>,
+    governance: GovernanceManager,
 }
 
 impl PluginRegistry {
@@ -351,6 +373,7 @@ impl PluginRegistry {
         }
 
         let plugin_id = manifest.id.clone();
+        let actor = plugin_actor(&manifest, ActorStatus::Disabled);
         self.plugins.insert(
             plugin_id,
             RegisteredPlugin {
@@ -360,19 +383,23 @@ impl PluginRegistry {
                 granted_permissions: BTreeSet::new(),
             },
         );
+        self.governance.policy_mut().upsert_actor(actor);
 
         Ok(())
     }
 
     pub fn enable_plugin(&mut self, plugin_id: &str) -> Result<(), RegistryError> {
-        let capability_ids = {
+        let (capability_ids, actor) = {
             let plugin = self.plugin(plugin_id)?;
-            plugin
-                .manifest
-                .capabilities
-                .iter()
-                .map(|capability| capability.id.clone())
-                .collect::<Vec<_>>()
+            (
+                plugin
+                    .manifest
+                    .capabilities
+                    .iter()
+                    .map(|capability| capability.id.clone())
+                    .collect::<Vec<_>>(),
+                plugin_actor(&plugin.manifest, ActorStatus::Enabled),
+            )
         };
 
         for capability_id in &capability_ids {
@@ -394,8 +421,12 @@ impl PluginRegistry {
 
         for capability_id in capability_ids {
             self.enabled_capabilities
-                .insert(capability_id, plugin_id.to_string());
+                .insert(capability_id.clone(), plugin_id.to_string());
+            self.governance
+                .policy_mut()
+                .upsert_rule(plugin_execution_rule(plugin_id, &capability_id));
         }
+        self.governance.policy_mut().upsert_actor(actor);
 
         Ok(())
     }
@@ -407,6 +438,10 @@ impl PluginRegistry {
         }
         self.enabled_capabilities
             .retain(|_, owner_plugin_id| owner_plugin_id != plugin_id);
+        self.governance
+            .policy_mut()
+            .set_actor_status(plugin_id, ActorStatus::Disabled)
+            .map_err(|error| RegistryError::GovernancePolicy(error.to_string()))?;
         Ok(())
     }
 
@@ -419,6 +454,10 @@ impl PluginRegistry {
                 })?;
         self.enabled_capabilities
             .retain(|_, owner_plugin_id| owner_plugin_id != plugin_id);
+        self.governance.policy_mut().remove_actor(plugin_id);
+        self.governance
+            .policy_mut()
+            .remove_rules_with_prefix(&plugin_rule_prefix(plugin_id));
         Ok(removed)
     }
 
@@ -439,7 +478,14 @@ impl PluginRegistry {
 
         self.plugin_mut(plugin_id)?
             .granted_permissions
-            .insert(permission);
+            .insert(permission.clone());
+        self.governance
+            .policy_mut()
+            .upsert_rule(plugin_permission_rule(
+                plugin_id,
+                capability_id,
+                &permission,
+            ));
         Ok(())
     }
 
@@ -451,20 +497,49 @@ impl PluginRegistry {
         self.plugin_mut(plugin_id)?
             .granted_permissions
             .remove(permission);
+        self.governance
+            .policy_mut()
+            .remove_rules_with_prefix(&plugin_permission_rule_prefix(plugin_id, permission));
         Ok(())
     }
 
     pub fn check_pre_execution(
-        &self,
+        &mut self,
         plugin_id: &str,
         capability_id: &str,
     ) -> Result<ExecutionPermit, RegistryError> {
+        self.check_pre_execution_with_context(
+            plugin_id,
+            capability_id,
+            PreExecutionContext::default(),
+        )
+    }
+
+    pub fn check_pre_execution_with_context(
+        &mut self,
+        plugin_id: &str,
+        capability_id: &str,
+        context: PreExecutionContext,
+    ) -> Result<ExecutionPermit, RegistryError> {
         let plugin = self.plugin(plugin_id)?;
-        if plugin.state != PluginState::Enabled {
-            return Err(RegistryError::PluginDisabled {
+        let capability = plugin
+            .manifest
+            .capabilities
+            .iter()
+            .find(|capability| capability.id == capability_id)
+            .cloned()
+            .ok_or_else(|| RegistryError::CapabilityNotFound {
                 plugin_id: plugin_id.to_string(),
-            });
-        }
+                capability_id: capability_id.to_string(),
+            })?;
+        let mut governance_decision_ids = Vec::new();
+
+        self.require_governance_allowed(
+            plugin_id,
+            capability_id,
+            governance_plugin_execution_request(plugin_id, capability_id, &context),
+            &mut governance_decision_ids,
+        )?;
 
         match self.enabled_capabilities.get(capability_id) {
             Some(owner_plugin_id) if owner_plugin_id == plugin_id => {}
@@ -483,24 +558,13 @@ impl PluginRegistry {
             }
         }
 
-        let capability = plugin
-            .manifest
-            .capabilities
-            .iter()
-            .find(|capability| capability.id == capability_id)
-            .ok_or_else(|| RegistryError::CapabilityNotFound {
-                plugin_id: plugin_id.to_string(),
-                capability_id: capability_id.to_string(),
-            })?;
-
         for permission in &capability.permissions {
-            if !plugin.granted_permissions.contains(permission) {
-                return Err(RegistryError::PermissionDenied {
-                    plugin_id: plugin_id.to_string(),
-                    capability_id: capability_id.to_string(),
-                    permission: permission.clone(),
-                });
-            }
+            self.require_governance_allowed(
+                plugin_id,
+                capability_id,
+                governance_permission_request(plugin_id, capability_id, permission, &context),
+                &mut governance_decision_ids,
+            )?;
         }
 
         Ok(ExecutionPermit {
@@ -508,7 +572,16 @@ impl PluginRegistry {
             capability_id: capability_id.to_string(),
             capability_kind: capability.kind,
             granted_permissions: capability.permissions.clone(),
+            governance_decision_ids,
         })
+    }
+
+    pub fn record_governance_approval(&mut self, approval: ApprovalRecord) {
+        self.governance.record_approval(approval);
+    }
+
+    pub fn governance_audit_export(&self) -> GovernanceAuditExport {
+        self.governance.export_audit()
     }
 
     pub fn is_enabled(&self, plugin_id: &str) -> bool {
@@ -560,6 +633,36 @@ impl PluginRegistry {
         RegistrySnapshot {
             plugins,
             enabled_capabilities,
+        }
+    }
+
+    fn require_governance_allowed(
+        &mut self,
+        plugin_id: &str,
+        capability_id: &str,
+        request: ActionRequest,
+        decision_ids: &mut Vec<String>,
+    ) -> Result<(), RegistryError> {
+        let decision = self.governance.evaluate(request);
+        let decision_id = decision.decision_id().to_string();
+        decision_ids.push(decision_id.clone());
+
+        match decision {
+            DecisionOutcome::Allowed(_) => Ok(()),
+            DecisionOutcome::Denied(denied) => Err(RegistryError::GovernanceDenied {
+                plugin_id: plugin_id.to_string(),
+                capability_id: capability_id.to_string(),
+                decision_id,
+                reason: format!("{:?}", denied.reason),
+            }),
+            DecisionOutcome::ApprovalRequired(required) => {
+                Err(RegistryError::GovernanceApprovalRequired {
+                    plugin_id: plugin_id.to_string(),
+                    capability_id: capability_id.to_string(),
+                    decision_id,
+                    missing_gates: required.missing_gates,
+                })
+            }
         }
     }
 
@@ -655,6 +758,24 @@ pub enum RegistryError {
         capability_id: String,
         permission: Permission,
     },
+    #[error("governance denied {plugin_id}/{capability_id} at {decision_id}: {reason}")]
+    GovernanceDenied {
+        plugin_id: String,
+        capability_id: String,
+        decision_id: String,
+        reason: String,
+    },
+    #[error(
+        "governance requires approval for {plugin_id}/{capability_id} at {decision_id}: {missing_gates:?}"
+    )]
+    GovernanceApprovalRequired {
+        plugin_id: String,
+        capability_id: String,
+        decision_id: String,
+        missing_gates: BTreeSet<GateKind>,
+    },
+    #[error("governance policy update failed: {0}")]
+    GovernancePolicy(String),
 }
 
 fn require_id(field: &'static str, value: &str) -> Result<(), ManifestValidationError> {
@@ -670,6 +791,202 @@ fn require_text(field: &'static str, value: &str) -> Result<(), ManifestValidati
         return Err(ManifestValidationError::MissingRequiredField { field });
     }
     Ok(())
+}
+
+fn plugin_actor(manifest: &PluginManifest, status: ActorStatus) -> GovernanceActor {
+    GovernanceActor {
+        id: manifest.id.clone(),
+        role: ActorRole::Plugin,
+        status,
+        parent_actor_id: None,
+        capabilities: manifest
+            .capabilities
+            .iter()
+            .map(|capability| governance_plugin_capability(&capability.id))
+            .collect(),
+        metadata: Metadata::new(),
+    }
+}
+
+fn governance_plugin_capability(capability_id: &str) -> cowork_governance::Capability {
+    cowork_governance::Capability::new(format!("plugin:{capability_id}"))
+}
+
+fn plugin_rule_prefix(plugin_id: &str) -> String {
+    format!("plugin/{plugin_id}/")
+}
+
+fn plugin_execution_rule_id(plugin_id: &str, capability_id: &str) -> String {
+    format!("{}execute/{capability_id}", plugin_rule_prefix(plugin_id))
+}
+
+fn plugin_permission_rule_prefix(plugin_id: &str, permission: &Permission) -> String {
+    let (action, resource_kind, _, _) = permission_governance_shape(permission);
+    format!(
+        "{}permission/{:?}/{:?}/{}/",
+        plugin_rule_prefix(plugin_id),
+        action,
+        resource_kind,
+        permission_scope_value(permission)
+    )
+}
+
+fn plugin_permission_rule_id(
+    plugin_id: &str,
+    capability_id: &str,
+    permission: &Permission,
+) -> String {
+    format!(
+        "{}{capability_id}",
+        plugin_permission_rule_prefix(plugin_id, permission)
+    )
+}
+
+fn plugin_execution_rule(plugin_id: &str, capability_id: &str) -> PolicyRule {
+    PolicyRule::allow(
+        plugin_execution_rule_id(plugin_id, capability_id),
+        ActorSelector::Exact(plugin_id.to_string()),
+    )
+    .for_capability(governance_plugin_capability(capability_id))
+    .with_action(ActionKind::Execute)
+    .with_resource(ResourceSelector::exact(
+        ResourceKind::PluginCapability,
+        plugin_capability_resource_id(plugin_id, capability_id),
+    ))
+}
+
+fn plugin_permission_rule(
+    plugin_id: &str,
+    capability_id: &str,
+    permission: &Permission,
+) -> PolicyRule {
+    let (action, _, risk, selector) = permission_governance_shape(permission);
+    PolicyRule::allow(
+        plugin_permission_rule_id(plugin_id, capability_id, permission),
+        ActorSelector::Exact(plugin_id.to_string()),
+    )
+    .for_capability(governance_plugin_capability(capability_id))
+    .with_action(action)
+    .with_resource(selector)
+    .with_gates(GateRequirements::for_risk(risk))
+}
+
+fn governance_plugin_execution_request(
+    plugin_id: &str,
+    capability_id: &str,
+    context: &PreExecutionContext,
+) -> ActionRequest {
+    request_with_context(
+        ActionRequest::new(
+            plugin_id,
+            ActionKind::Execute,
+            Resource::new(
+                ResourceKind::PluginCapability,
+                plugin_capability_resource_id(plugin_id, capability_id),
+            ),
+            ActionRisk::Low,
+        )
+        .with_capability(governance_plugin_capability(capability_id)),
+        None,
+        context,
+    )
+}
+
+fn governance_permission_request(
+    plugin_id: &str,
+    capability_id: &str,
+    permission: &Permission,
+    context: &PreExecutionContext,
+) -> ActionRequest {
+    let (action, resource_kind, risk, _) = permission_governance_shape(permission);
+    request_with_context(
+        ActionRequest::new(
+            plugin_id,
+            action,
+            Resource::new(resource_kind, permission_scope_value(permission)),
+            risk,
+        )
+        .with_capability(governance_plugin_capability(capability_id)),
+        context.permission_approvals.get(permission).cloned(),
+        context,
+    )
+}
+
+fn request_with_context(
+    mut request: ActionRequest,
+    approval_id: Option<String>,
+    context: &PreExecutionContext,
+) -> ActionRequest {
+    if let Some(approval_id) = approval_id {
+        request = request.with_approval(approval_id);
+    }
+    request.metadata = context.metadata.clone();
+    request.justification = context.justification.clone();
+    request.with_evidence(context.evidence.clone())
+}
+
+fn permission_governance_shape(
+    permission: &Permission,
+) -> (ActionKind, ResourceKind, ActionRisk, ResourceSelector) {
+    let (action, resource_kind, risk) = match permission.kind {
+        PermissionKind::WorkspaceRead => (ActionKind::Read, ResourceKind::Folder, ActionRisk::Low),
+        PermissionKind::WorkspaceWrite => {
+            (ActionKind::Write, ResourceKind::Folder, ActionRisk::Medium)
+        }
+        PermissionKind::ProcessSpawn => (
+            ActionKind::SpawnProcess,
+            ResourceKind::Tool,
+            ActionRisk::High,
+        ),
+        PermissionKind::Network => (
+            ActionKind::NetworkRequest,
+            ResourceKind::NetworkEndpoint,
+            ActionRisk::External,
+        ),
+        PermissionKind::BrowserProfile => (
+            ActionKind::BrowserAction,
+            ResourceKind::BrowserProfile,
+            ActionRisk::Medium,
+        ),
+        PermissionKind::ProviderCredential => (
+            ActionKind::ProviderCall,
+            ResourceKind::Provider,
+            ActionRisk::External,
+        ),
+        PermissionKind::ConnectorAccount => (
+            ActionKind::ConnectorCall,
+            ResourceKind::Connector,
+            ActionRisk::External,
+        ),
+        PermissionKind::ArtifactWrite => (
+            ActionKind::Write,
+            ResourceKind::Artifact,
+            ActionRisk::Medium,
+        ),
+    };
+
+    let selector = match &permission.scope {
+        PermissionScope::Any => ResourceSelector {
+            kind: Some(resource_kind),
+            pattern: ScopePattern::Any,
+        },
+        PermissionScope::Pattern(pattern) => {
+            ResourceSelector::pattern(resource_kind, pattern.as_str())
+        }
+    };
+
+    (action, resource_kind, risk, selector)
+}
+
+fn permission_scope_value(permission: &Permission) -> String {
+    match &permission.scope {
+        PermissionScope::Any => "*".to_string(),
+        PermissionScope::Pattern(pattern) => pattern.clone(),
+    }
+}
+
+fn plugin_capability_resource_id(plugin_id: &str, capability_id: &str) -> String {
+    format!("plugin://{plugin_id}/{capability_id}")
 }
 
 #[cfg(test)]
@@ -726,13 +1043,25 @@ mod tests {
             .check_pre_execution("cowork.example", "cowork.example.web-search")
             .unwrap_err();
 
-        assert_eq!(
+        assert!(matches!(
             error,
-            RegistryError::PermissionDenied {
-                plugin_id: "cowork.example".to_string(),
-                capability_id: "cowork.example.web-search".to_string(),
-                permission,
-            }
+            RegistryError::GovernanceDenied {
+                plugin_id,
+                capability_id,
+                reason,
+                ..
+            } if plugin_id == "cowork.example"
+                && capability_id == "cowork.example.web-search"
+                && reason.contains("NoAllowRule")
+        ));
+        assert_eq!(
+            registry.governance_audit_export().decisions.len(),
+            2,
+            "execution and permission checks are both audited by governance"
+        );
+        assert_eq!(
+            registry.governance_audit_export().decisions[0].decision_id,
+            "decision/1"
         );
     }
 
@@ -768,8 +1097,111 @@ mod tests {
         assert_eq!(registry.capability_owner("cowork.example.web-search"), None);
         assert!(matches!(
             registry.check_pre_execution("cowork.example", "cowork.example.web-search"),
-            Err(RegistryError::PluginDisabled { .. })
+            Err(RegistryError::GovernanceDenied { reason, .. }) if reason.contains("ActorDisabled")
         ));
+    }
+
+    #[test]
+    fn external_plugin_permission_requires_approval_and_evidence() {
+        let permission = Permission::new(PermissionKind::Network, "https://api.example.invalid/*");
+        let mut registry =
+            registry_with_plugin(fixture_manifest_with_permission(permission.clone()));
+        registry
+            .enable_plugin("cowork.example")
+            .expect("enable plugin");
+        registry
+            .grant_permission(
+                "cowork.example",
+                "cowork.example.web-search",
+                permission.clone(),
+            )
+            .expect("grant declared permission");
+
+        let error = registry
+            .check_pre_execution("cowork.example", "cowork.example.web-search")
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            RegistryError::GovernanceApprovalRequired { missing_gates, .. }
+                if missing_gates == BTreeSet::from([GateKind::Approval, GateKind::Evidence])
+        ));
+
+        registry.record_governance_approval(
+            ApprovalRecord::approved_for(
+                "approval/network-search",
+                "cowork.example",
+                ActionKind::NetworkRequest,
+                Resource::new(
+                    ResourceKind::NetworkEndpoint,
+                    "https://api.example.invalid/*",
+                ),
+                "user/alice",
+            )
+            .with_evidence(EvidenceBundle {
+                artifacts: vec![cowork_governance::EvidenceArtifact::new(
+                    "evidence/network-approval",
+                    "User approved this connector request.",
+                )],
+                ..EvidenceBundle::default()
+            }),
+        );
+
+        let permit = registry
+            .check_pre_execution_with_context(
+                "cowork.example",
+                "cowork.example.web-search",
+                PreExecutionContext {
+                    permission_approvals: BTreeMap::from([(
+                        permission,
+                        "approval/network-search".to_string(),
+                    )]),
+                    evidence: EvidenceBundle::default(),
+                    justification: "approved search call".to_string(),
+                    metadata: Metadata::new(),
+                },
+            )
+            .expect("approved external permission should pass");
+
+        assert_eq!(permit.governance_decision_ids.len(), 2);
+    }
+
+    #[test]
+    fn governance_audit_redacts_plugin_pre_execution_metadata() {
+        let permission = Permission::new(PermissionKind::WorkspaceRead, "workspace://project/**");
+        let mut registry =
+            registry_with_plugin(fixture_manifest_with_permission(permission.clone()));
+        registry
+            .enable_plugin("cowork.example")
+            .expect("enable plugin");
+        registry
+            .grant_permission("cowork.example", "cowork.example.web-search", permission)
+            .expect("grant declared permission");
+        let synthetic_credential = format!("{}{}", "ghp_", "abcdefghijklmnopqrstuvwxyz");
+        let synthetic_assignment = format!("{}={}", "token", "abcdef1234567890");
+        let mut metadata = Metadata::new();
+        metadata.insert(
+            "access_token".to_string(),
+            serde_json::json!(synthetic_credential),
+        );
+
+        registry
+            .check_pre_execution_with_context(
+                "cowork.example",
+                "cowork.example.web-search",
+                PreExecutionContext {
+                    permission_approvals: BTreeMap::new(),
+                    evidence: EvidenceBundle::default(),
+                    justification: synthetic_assignment,
+                    metadata,
+                },
+            )
+            .expect("workspace read should pass");
+
+        let export = serde_json::to_string(&registry.governance_audit_export()).unwrap();
+        assert!(!export.contains("abcdefghijklmnopqrstuvwxyz"));
+        assert!(!export.contains("abcdef1234567890"));
+        assert!(export.contains(cowork_governance::REDACTED));
     }
 
     #[test]
