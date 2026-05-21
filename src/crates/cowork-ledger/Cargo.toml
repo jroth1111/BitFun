@@ -1,0 +1,16 @@
+[package]
+name = "cowork-ledger"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+description = "Cowork-owned durable ledger domain model and root-scope authority"
+
+[lib]
+name = "cowork_ledger"
+crate-type = ["rlib"]
+
+[dependencies]
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
