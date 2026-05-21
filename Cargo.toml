@@ -13,6 +13,7 @@ members = [
     "src/crates/cowork-runtime",
     "src/crates/cowork-context",
     "src/crates/cowork-protocol",
+    "src/crates/cowork-provider-registry",
     "src/crates/cowork-plugin-registry",
     "src/crates/cowork-workspace",
     "src/crates/agent-tools",

@@ -26,7 +26,7 @@ use thiserror::Error;
 pub const PROTOCOL_NAME: &str = "cowork.daemon";
 pub const JSON_RPC_VERSION: &str = "2.0";
 pub const PROTOCOL_VERSION_MAJOR: u16 = 1;
-pub const PROTOCOL_VERSION_MINOR: u16 = 3;
+pub const PROTOCOL_VERSION_MINOR: u16 = 4;
 pub const PROTOCOL_VERSION_PATCH: u16 = 0;
 
 pub type Metadata = BTreeMap<String, serde_json::Value>;
@@ -922,6 +922,10 @@ pub struct Provider {
     pub capabilities: Vec<ProviderCapability>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub credential_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "ProviderCredentialStatus::is_empty")]
+    pub credential_status: ProviderCredentialStatus,
+    #[serde(default, skip_serializing_if = "ProviderRoutingMetadata::is_empty")]
+    pub routing: ProviderRoutingMetadata,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub metadata: Metadata,
 }
@@ -953,8 +957,138 @@ pub enum ProviderCapability {
     Vision,
     ToolUse,
     FileInput,
+    FileOutput,
     LongContext,
     Embeddings,
+    Streaming,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderCredentialStatus {
+    pub method: ProviderAuthMethod,
+    pub state: ProviderCredentialState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub handle: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+impl ProviderCredentialStatus {
+    pub fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+impl Default for ProviderCredentialStatus {
+    fn default() -> Self {
+        Self {
+            method: ProviderAuthMethod::None,
+            state: ProviderCredentialState::NotRequired,
+            handle: None,
+            label: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderAuthMethod {
+    None,
+    ApiKey,
+    OAuth,
+    SubscriptionCli,
+    LocalEndpoint,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderCredentialState {
+    NotRequired,
+    Available,
+    Missing,
+    Blocked,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderRoutingMetadata {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_window_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "ProviderToolSupport::is_empty")]
+    pub tool_support: ProviderToolSupport,
+    #[serde(default, skip_serializing_if = "ProviderRateLimits::is_empty")]
+    pub rate_limits: ProviderRateLimits,
+    #[serde(default, skip_serializing_if = "ProviderCost::is_empty")]
+    pub cost: ProviderCost,
+}
+
+impl ProviderRoutingMetadata {
+    pub fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderToolSupport {
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub tool_use: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub file_input: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub file_output: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub vision: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub streaming: bool,
+}
+
+impl ProviderToolSupport {
+    pub fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderRateLimits {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requests_per_minute: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tokens_per_minute: Option<u32>,
+}
+
+impl ProviderRateLimits {
+    pub fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderCost {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub currency: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_per_million_micros: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_per_million_micros: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached_input_per_million_micros: Option<u64>,
+}
+
+impl ProviderCost {
+    pub fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1328,8 +1462,39 @@ mod tests {
                 label: "local gateway".to_string(),
                 status: ProviderStatus::Available,
                 selected_model: Some("cowork-model".to_string()),
-                capabilities: vec![ProviderCapability::Text, ProviderCapability::ToolUse],
+                capabilities: vec![
+                    ProviderCapability::Text,
+                    ProviderCapability::ToolUse,
+                    ProviderCapability::Streaming,
+                ],
                 credential_ref: Some("keychain://cowork/provider-1".to_string()),
+                credential_status: ProviderCredentialStatus {
+                    method: ProviderAuthMethod::ApiKey,
+                    state: ProviderCredentialState::Available,
+                    handle: Some("keychain://cowork/provider-1".to_string()),
+                    label: Some("provider-1-key".to_string()),
+                },
+                routing: ProviderRoutingMetadata {
+                    context_window_tokens: Some(128_000),
+                    max_output_tokens: Some(16_384),
+                    tool_support: ProviderToolSupport {
+                        tool_use: true,
+                        file_input: true,
+                        file_output: false,
+                        vision: false,
+                        streaming: true,
+                    },
+                    rate_limits: ProviderRateLimits {
+                        requests_per_minute: Some(120),
+                        tokens_per_minute: Some(1_000_000),
+                    },
+                    cost: ProviderCost {
+                        currency: Some("USD".to_string()),
+                        input_per_million_micros: Some(250_000),
+                        output_per_million_micros: Some(1_000_000),
+                        cached_input_per_million_micros: Some(25_000),
+                    },
+                },
                 metadata: Metadata::new(),
             }],
             browser: BrowserState {

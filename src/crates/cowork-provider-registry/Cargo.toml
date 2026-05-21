@@ -1,0 +1,16 @@
+[package]
+name = "cowork-provider-registry"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+description = "Cowork local credential vault and provider capability registry"
+
+[lib]
+name = "cowork_provider_registry"
+crate-type = ["rlib"]
+
+[dependencies]
+cowork-protocol = { path = "../cowork-protocol" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

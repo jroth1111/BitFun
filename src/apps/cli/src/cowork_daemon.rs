@@ -5,10 +5,12 @@ use cowork_protocol::{
     CoworkEventLog, CoworkEventPollRequest, CoworkEventPollResult, CoworkSnapshot, Evidence,
     EvidenceKind, HistoryRetrievalRequest, HistoryRetrievalResult, HistoryRetrievalTarget,
     HistorySequenceRange, Metadata, Objective, ObjectiveStatus, ProtocolEnvelope, ProtocolError,
-    ProtocolErrorCode, ProtocolVersion, Provider, ProviderCapability, ProviderKind, ProviderStatus,
-    RunStatus, Subagent, SubagentBudget, SubagentDefinition, SubagentLifecycleState,
-    SubagentRegistry, SubagentStatus, SubagentWorkspace, Task, TaskStatus, WorkerInbox,
-    WorkerInboxMessage, WorkerInboxMessageKind, WorkerInboxMessageStatus,
+    ProtocolErrorCode, ProtocolVersion, Provider, ProviderAuthMethod, ProviderCapability,
+    ProviderCost, ProviderCredentialState, ProviderCredentialStatus, ProviderKind,
+    ProviderRateLimits, ProviderRoutingMetadata, ProviderStatus, ProviderToolSupport, RunStatus,
+    Subagent, SubagentBudget, SubagentDefinition, SubagentLifecycleState, SubagentRegistry,
+    SubagentStatus, SubagentWorkspace, Task, TaskStatus, WorkerInbox, WorkerInboxMessage,
+    WorkerInboxMessageKind, WorkerInboxMessageStatus,
 };
 use serde::Serialize;
 use std::error::Error;
@@ -1007,25 +1009,72 @@ fn render_providers(markdown: &mut String, providers: &[Provider]) {
         return;
     }
 
-    markdown.push_str("| ID | Kind | Label | Status | Model | Capabilities |\n");
-    markdown.push_str("| --- | --- | --- | --- | --- | --- |\n");
+    markdown.push_str(
+        "| ID | Kind | Label | Status | Model | Capabilities | Credential | Context | Tools | Cost |\n",
+    );
+    markdown.push_str("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n");
     for provider in providers {
         let capabilities = provider
             .capabilities
             .iter()
             .map(json_label)
             .collect::<Vec<_>>();
+        let tools = provider_tool_summary(&provider.routing.tool_support);
+        let cost = provider_cost_summary(&provider.routing.cost);
         markdown.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {} |\n",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
             escape_cell(&provider.id),
             escape_cell(json_label(&provider.kind)),
             escape_cell(&provider.label),
             escape_cell(json_label(&provider.status)),
             escape_cell(provider.selected_model.as_deref().unwrap_or("none")),
-            escape_cell(join_or_none(&capabilities))
+            escape_cell(join_or_none(&capabilities)),
+            escape_cell(json_label(&provider.credential_status.state)),
+            escape_cell(
+                &provider
+                    .routing
+                    .context_window_tokens
+                    .map(|tokens| tokens.to_string())
+                    .unwrap_or_else(|| "none".to_string())
+            ),
+            escape_cell(&tools),
+            escape_cell(&cost)
         ));
     }
     markdown.push('\n');
+}
+
+fn provider_tool_summary(tools: &ProviderToolSupport) -> String {
+    let mut supported = Vec::new();
+    if tools.tool_use {
+        supported.push("tool_use".to_string());
+    }
+    if tools.file_input {
+        supported.push("file_input".to_string());
+    }
+    if tools.file_output {
+        supported.push("file_output".to_string());
+    }
+    if tools.vision {
+        supported.push("vision".to_string());
+    }
+    if tools.streaming {
+        supported.push("streaming".to_string());
+    }
+    join_or_none(&supported)
+}
+
+fn provider_cost_summary(cost: &ProviderCost) -> String {
+    match (
+        cost.currency.as_deref(),
+        cost.input_per_million_micros,
+        cost.output_per_million_micros,
+    ) {
+        (Some(currency), Some(input), Some(output)) => {
+            format!("{currency}:{input}/{output} micro-units per 1M")
+        }
+        _ => "none".to_string(),
+    }
 }
 
 fn render_subagents(markdown: &mut String, subagents: &[Subagent]) {
@@ -1424,8 +1473,41 @@ impl LocalSmokeDaemon {
                 label: "smoke provider".to_string(),
                 status: ProviderStatus::Available,
                 selected_model: Some("cowork-smoke-model".to_string()),
-                capabilities: vec![ProviderCapability::Text, ProviderCapability::ToolUse],
-                credential_ref: None,
+                capabilities: vec![
+                    ProviderCapability::Text,
+                    ProviderCapability::ToolUse,
+                    ProviderCapability::Streaming,
+                ],
+                credential_ref: Some(
+                    "keychain://cowork/providers/cowork-smoke-provider".to_string(),
+                ),
+                credential_status: ProviderCredentialStatus {
+                    method: ProviderAuthMethod::ApiKey,
+                    state: ProviderCredentialState::Available,
+                    handle: Some("keychain://cowork/providers/cowork-smoke-provider".to_string()),
+                    label: Some("cowork-smoke-provider-key".to_string()),
+                },
+                routing: ProviderRoutingMetadata {
+                    context_window_tokens: Some(128_000),
+                    max_output_tokens: Some(16_384),
+                    tool_support: ProviderToolSupport {
+                        tool_use: true,
+                        file_input: true,
+                        file_output: false,
+                        vision: false,
+                        streaming: true,
+                    },
+                    rate_limits: ProviderRateLimits {
+                        requests_per_minute: Some(120),
+                        tokens_per_minute: Some(1_000_000),
+                    },
+                    cost: ProviderCost {
+                        currency: Some("USD".to_string()),
+                        input_per_million_micros: Some(250_000),
+                        output_per_million_micros: Some(1_000_000),
+                        cached_input_per_million_micros: Some(25_000),
+                    },
+                },
                 metadata: self.metadata(),
             }],
             browser: BrowserState {
@@ -1780,6 +1862,29 @@ mod tests {
     }
 
     #[test]
+    fn export_provider_registry_includes_routing_metadata_without_secret_material() {
+        let export_json =
+            run_action(DaemonAction::Export(DaemonExportOptions::default())).expect("export json");
+        let export_value: serde_json::Value =
+            serde_json::from_str(&export_json).expect("parse export");
+        let provider = &export_value["providers"][0];
+
+        assert_eq!(provider["credentialStatus"]["state"], "available");
+        assert_eq!(
+            provider["credentialStatus"]["handle"],
+            "keychain://cowork/providers/cowork-smoke-provider"
+        );
+        assert_eq!(provider["routing"]["contextWindowTokens"], 128_000);
+        assert_eq!(provider["routing"]["toolSupport"]["toolUse"], true);
+        assert_eq!(provider["routing"]["toolSupport"]["streaming"], true);
+        assert_eq!(
+            provider["routing"]["cost"]["inputPerMillionMicros"],
+            250_000
+        );
+        assert!(!export_json.contains("sk-test-cowork-smoke-secret"));
+    }
+
+    #[test]
     fn export_markdown_includes_all_ledger_sections() {
         let markdown = run_action(DaemonAction::Export(DaemonExportOptions {
             smoke: DaemonSmokeOptions::default(),
@@ -1810,6 +1915,9 @@ mod tests {
         assert!(markdown.contains("cowork-smoke-inbox-1"));
         assert!(markdown.contains("cowork-smoke-provider"));
         assert!(markdown.contains("cowork-smoke-browser"));
+        assert!(markdown.contains("128000"));
+        assert!(markdown.contains("tool_use, file_input, streaming"));
+        assert!(markdown.contains("USD:250000/1000000 micro-units per 1M"));
     }
 
     #[test]
