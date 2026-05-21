@@ -707,6 +707,19 @@ impl CoworkLedger {
                         .artifact_ids_produced_by(&EntityRef::Session(session.id.clone())),
                 })
                 .collect(),
+            waivers: self
+                .waivers
+                .values()
+                .map(|waiver| WaiverEvidenceNode {
+                    id: waiver.id.clone(),
+                    waived_entity: waiver.waived_entity.clone(),
+                    reason: waiver.reason.clone(),
+                    granted_by: waiver.granted_by.clone(),
+                    granted_at: waiver.granted_at,
+                    expires_at: waiver.expires_at,
+                    evidence_id: waiver.evidence_id.clone(),
+                })
+                .collect(),
             provenance_links: self.provenance_links.values().cloned().collect(),
         }
     }
@@ -725,6 +738,7 @@ impl CoworkLedger {
             .filter(|task| {
                 task.status == TaskStatus::Verified
                     && !self.task_has_passed_supporting_evidence(&task.id)
+                    && !self.task_has_valid_verification_waiver(&task.id)
             })
             .map(|task| task.id.clone())
             .collect();
@@ -851,14 +865,14 @@ impl CoworkLedger {
             applied.effects.push("stop_reason".to_string());
         }
 
-        for status_update in summary.task_status_updates {
-            self.update_task_status(status_update)?;
-            applied.effects.push("task_status".to_string());
-        }
-
         for waiver in summary.waivers {
             self.record_waiver(waiver)?;
             applied.effects.push("waiver".to_string());
+        }
+
+        for status_update in summary.task_status_updates {
+            self.update_task_status(status_update)?;
+            applied.effects.push("task_status".to_string());
         }
 
         for link in summary.provenance_links {
@@ -908,6 +922,17 @@ impl CoworkLedger {
             )?;
         }
 
+        if update.status == TaskStatus::Verified {
+            self.validate_verified_task_support(&update, from_status)?;
+        } else if update.verification_waiver_id.is_some() {
+            return Err(LedgerError::InvalidTaskTransition {
+                task_id: update.task_id.clone(),
+                from: from_status,
+                to: update.status,
+                reason: "verification waiver is only valid for verified task transitions",
+            });
+        }
+
         for blocker_id in &update.blocker_ids {
             self.require_entity_exists(
                 &update.subject_ref(),
@@ -926,6 +951,7 @@ impl CoworkLedger {
             evidence_ids: update.evidence_ids.clone(),
             blocker_ids: update.blocker_ids.clone(),
             stop_reason_id: update.stop_reason_id.clone(),
+            verification_waiver_id: update.verification_waiver_id.clone(),
             metadata: update.metadata.clone(),
         };
 
@@ -942,6 +968,92 @@ impl CoworkLedger {
             push_unique(&mut task.blocker_ids, blocker_id);
         }
         self.task_transitions.push(transition);
+        Ok(())
+    }
+
+    fn validate_verified_task_support(
+        &self,
+        update: &TaskStatusUpdate,
+        from_status: TaskStatus,
+    ) -> Result<(), LedgerError> {
+        if self.task_would_have_passed_supporting_evidence(&update.task_id, &update.evidence_ids) {
+            return Ok(());
+        }
+
+        if let Some(waiver_id) = &update.verification_waiver_id {
+            self.validate_verification_waiver(
+                waiver_id,
+                &update.task_id,
+                update.updated_at,
+                from_status,
+                update.status,
+            )?;
+            return Ok(());
+        }
+
+        Err(LedgerError::InvalidTaskTransition {
+            task_id: update.task_id.clone(),
+            from: from_status,
+            to: update.status,
+            reason: "verified task transition requires passed supporting evidence or a verification waiver",
+        })
+    }
+
+    fn validate_verification_waiver(
+        &self,
+        waiver_id: &WaiverId,
+        task_id: &TaskId,
+        transition_time: DateTime<Utc>,
+        from_status: TaskStatus,
+        to_status: TaskStatus,
+    ) -> Result<(), LedgerError> {
+        let waiver = self
+            .waivers
+            .get(waiver_id)
+            .ok_or_else(|| LedgerError::UnknownReference {
+                from: EntityRef::Task(task_id.clone()),
+                to: EntityRef::Waiver(waiver_id.clone()),
+            })?;
+
+        if waiver.waived_entity != EntityRef::Task(task_id.clone()) {
+            return Err(LedgerError::InvalidTaskTransition {
+                task_id: task_id.clone(),
+                from: from_status,
+                to: to_status,
+                reason: "verification waiver must name the verified task as its scope",
+            });
+        }
+
+        if waiver.reason.trim().is_empty() {
+            return Err(LedgerError::InvalidTaskTransition {
+                task_id: task_id.clone(),
+                from: from_status,
+                to: to_status,
+                reason: "verification waiver requires a reason",
+            });
+        }
+
+        if waiver.granted_by.id.trim().is_empty() {
+            return Err(LedgerError::InvalidTaskTransition {
+                task_id: task_id.clone(),
+                from: from_status,
+                to: to_status,
+                reason: "verification waiver requires an actor",
+            });
+        }
+
+        if waiver
+            .expires_at
+            .is_some_and(|expires_at| expires_at <= transition_time)
+        {
+            return Err(LedgerError::InvalidTaskTransition {
+                task_id: task_id.clone(),
+                from: from_status,
+                to: to_status,
+                reason: "verification waiver is expired",
+            });
+        }
+
         Ok(())
     }
 
@@ -1263,6 +1375,7 @@ impl CoworkLedger {
 
     fn record_waiver(&mut self, waiver: Waiver) -> Result<(), LedgerError> {
         require_text("waiver.reason", &waiver.reason)?;
+        require_text("waiver.grantedBy.id", &waiver.granted_by.id)?;
         self.require_entity_exists(&EntityRef::Waiver(waiver.id.clone()), &waiver.waived_entity)?;
 
         if let Some(evidence_id) = &waiver.evidence_id {
@@ -1480,6 +1593,47 @@ impl CoworkLedger {
                     .is_some_and(|evidence| evidence.result == EvidenceResult::Passed)
             })
     }
+
+    fn task_would_have_passed_supporting_evidence(
+        &self,
+        task_id: &TaskId,
+        transition_evidence_ids: &[EvidenceId],
+    ) -> bool {
+        let mut evidence_ids = self.evidence_ids_for_subject(&EntityRef::Task(task_id.clone()));
+        for evidence_id in transition_evidence_ids {
+            push_unique(&mut evidence_ids, evidence_id.clone());
+        }
+
+        evidence_ids.iter().any(|evidence_id| {
+            self.evidence
+                .get(evidence_id)
+                .is_some_and(|evidence| evidence.result == EvidenceResult::Passed)
+        })
+    }
+
+    fn task_has_valid_verification_waiver(&self, task_id: &TaskId) -> bool {
+        self.task_transitions
+            .iter()
+            .rev()
+            .filter(|transition| {
+                transition.task_id == *task_id && transition.to_status == TaskStatus::Verified
+            })
+            .any(|transition| {
+                transition
+                    .verification_waiver_id
+                    .as_ref()
+                    .is_some_and(|waiver_id| {
+                        self.validate_verification_waiver(
+                            waiver_id,
+                            task_id,
+                            transition.transitioned_at,
+                            transition.from_status,
+                            transition.to_status,
+                        )
+                        .is_ok()
+                    })
+            })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1623,6 +1777,8 @@ pub struct TaskStatusUpdate {
     pub blocker_ids: Vec<BlockerId>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop_reason_id: Option<StopReasonId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification_waiver_id: Option<WaiverId>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub metadata: Metadata,
 }
@@ -1648,6 +1804,8 @@ pub struct TaskTransition {
     pub blocker_ids: Vec<BlockerId>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop_reason_id: Option<StopReasonId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification_waiver_id: Option<WaiverId>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub metadata: Metadata,
 }
@@ -2026,6 +2184,8 @@ pub struct EvidenceGraph {
     pub artifacts: Vec<ArtifactEvidenceNode>,
     pub browser_actions: Vec<BrowserActionEvidenceNode>,
     pub sessions: Vec<SessionEvidenceNode>,
+    #[serde(default)]
+    pub waivers: Vec<WaiverEvidenceNode>,
     pub provenance_links: Vec<ProvenanceLink>,
 }
 
@@ -2081,6 +2241,20 @@ pub struct SessionEvidenceNode {
     pub actor: ActorRef,
     pub evidence_ids: Vec<EvidenceId>,
     pub artifact_ids: Vec<ArtifactId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WaiverEvidenceNode {
+    pub id: WaiverId,
+    pub waived_entity: EntityRef,
+    pub reason: String,
+    pub granted_by: ActorRef,
+    pub granted_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence_id: Option<EvidenceId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2416,6 +2590,7 @@ mod tests {
                 evidence_ids: vec![evidence_id()],
                 blocker_ids: vec![blocker_id()],
                 stop_reason_id: Some(blocked_stop_reason_id()),
+                verification_waiver_id: None,
                 metadata: Metadata::new(),
             }))
             .expect("blocked transition records complete context");
@@ -2465,6 +2640,7 @@ mod tests {
                 evidence_ids: Vec::new(),
                 blocker_ids: Vec::new(),
                 stop_reason_id: None,
+                verification_waiver_id: None,
                 metadata: Metadata::new(),
             }))
             .expect_err("verified task transition requires typed stop reason");
@@ -2484,11 +2660,92 @@ mod tests {
     }
 
     #[test]
-    fn invalid_task_transitions_fail_loudly_without_mutating_history() {
+    fn verified_task_without_evidence_or_waiver_fails_without_mutating_history() {
         let mut ledger = fixture_ledger_with_task();
         ledger
             .apply_update(LedgerUpdate::RecordStopReason(verified_stop_reason()))
             .expect("record verified stop reason");
+
+        let error = ledger
+            .apply_update(LedgerUpdate::UpdateTaskStatus(TaskStatusUpdate {
+                task_id: task_id(),
+                status: TaskStatus::Verified,
+                updated_at: timestamp(13),
+                updated_by: worker(),
+                evidence_ids: Vec::new(),
+                blocker_ids: Vec::new(),
+                stop_reason_id: Some(verified_stop_reason_id()),
+                verification_waiver_id: None,
+                metadata: Metadata::new(),
+            }))
+            .expect_err("verified transition requires evidence or waiver");
+
+        assert!(matches!(
+            error,
+            LedgerError::InvalidTaskTransition {
+                to: TaskStatus::Verified,
+                ..
+            }
+        ));
+        assert!(ledger.task_transitions().is_empty());
+        assert_eq!(
+            ledger.tasks().get(&task_id()).expect("task exists").status,
+            TaskStatus::InProgress
+        );
+    }
+
+    #[test]
+    fn verified_task_with_passed_linked_evidence_passes_and_records_transition_evidence() {
+        let mut ledger = fixture_ledger_with_task();
+        ledger
+            .apply_update(LedgerUpdate::RecordEvidence(passed_task_evidence(
+                evidence_id(),
+            )))
+            .expect("record passed task evidence");
+        ledger
+            .apply_update(LedgerUpdate::RecordStopReason(verified_stop_reason()))
+            .expect("record verified stop reason");
+
+        ledger
+            .apply_update(LedgerUpdate::UpdateTaskStatus(TaskStatusUpdate {
+                task_id: task_id(),
+                status: TaskStatus::Verified,
+                updated_at: timestamp(13),
+                updated_by: worker(),
+                evidence_ids: vec![evidence_id()],
+                blocker_ids: Vec::new(),
+                stop_reason_id: Some(verified_stop_reason_id()),
+                verification_waiver_id: None,
+                metadata: Metadata::new(),
+            }))
+            .expect("verified transition accepts passed evidence");
+
+        let task = ledger.tasks().get(&task_id()).expect("task exists");
+        assert_eq!(task.status, TaskStatus::Verified);
+        assert_eq!(task.evidence_ids, vec![evidence_id()]);
+        let transition = ledger
+            .task_transitions()
+            .first()
+            .expect("transition recorded");
+        assert_eq!(transition.evidence_ids, vec![evidence_id()]);
+        assert_eq!(transition.verification_waiver_id, None);
+        assert!(ledger.audit_evidence_graph().is_clean());
+    }
+
+    #[test]
+    fn verified_task_with_explicit_waiver_records_reason_actor_and_task_scope() {
+        let mut ledger = fixture_ledger_with_task();
+        ledger
+            .apply_update(LedgerUpdate::RecordWaiver(task_waiver(
+                waiver_id(),
+                task_id(),
+                None,
+            )))
+            .expect("record task waiver");
+        ledger
+            .apply_update(LedgerUpdate::RecordStopReason(verified_stop_reason()))
+            .expect("record verified stop reason");
+
         ledger
             .apply_update(LedgerUpdate::UpdateTaskStatus(TaskStatusUpdate {
                 task_id: task_id(),
@@ -2498,6 +2755,210 @@ mod tests {
                 evidence_ids: Vec::new(),
                 blocker_ids: Vec::new(),
                 stop_reason_id: Some(verified_stop_reason_id()),
+                verification_waiver_id: Some(waiver_id()),
+                metadata: Metadata::new(),
+            }))
+            .expect("verified transition accepts explicit waiver");
+
+        let transition = ledger
+            .task_transitions()
+            .first()
+            .expect("transition recorded");
+        assert_eq!(transition.verification_waiver_id, Some(waiver_id()));
+
+        let graph = ledger.export_evidence_graph();
+        let waiver_node = graph.waivers.first().expect("waiver is exported");
+        assert_eq!(
+            waiver_node.reason,
+            "Verifier accepted scoped manual waiver."
+        );
+        assert_eq!(waiver_node.granted_by, worker());
+        assert_eq!(waiver_node.waived_entity, EntityRef::Task(task_id()));
+
+        let exported = serde_json::to_value(&ledger).expect("export ledger");
+        assert_eq!(
+            exported["taskTransitions"][0]["verificationWaiverId"],
+            "waiver/manual-browser-evidence"
+        );
+        assert!(ledger.audit_evidence_graph().is_clean());
+    }
+
+    #[test]
+    fn non_passed_evidence_does_not_satisfy_verified_completion() {
+        let mut ledger = fixture_ledger_with_task();
+        ledger
+            .apply_update(LedgerUpdate::RecordEvidence(evidence_with_result(
+                evidence_id(),
+                EvidenceResult::Informational,
+            )))
+            .expect("record informational task evidence");
+        ledger
+            .apply_update(LedgerUpdate::RecordStopReason(verified_stop_reason()))
+            .expect("record verified stop reason");
+
+        let error = ledger
+            .apply_update(LedgerUpdate::UpdateTaskStatus(TaskStatusUpdate {
+                task_id: task_id(),
+                status: TaskStatus::Verified,
+                updated_at: timestamp(13),
+                updated_by: worker(),
+                evidence_ids: vec![evidence_id()],
+                blocker_ids: Vec::new(),
+                stop_reason_id: Some(verified_stop_reason_id()),
+                verification_waiver_id: None,
+                metadata: Metadata::new(),
+            }))
+            .expect_err("informational evidence cannot verify completion");
+
+        assert!(matches!(
+            error,
+            LedgerError::InvalidTaskTransition {
+                to: TaskStatus::Verified,
+                ..
+            }
+        ));
+        assert!(ledger.task_transitions().is_empty());
+        assert_eq!(
+            ledger.tasks().get(&task_id()).expect("task exists").status,
+            TaskStatus::InProgress
+        );
+    }
+
+    #[test]
+    fn missing_wrong_scope_and_expired_waivers_do_not_satisfy_verified_completion() {
+        let missing = {
+            let mut ledger = fixture_ledger_with_task();
+            ledger
+                .apply_update(LedgerUpdate::RecordStopReason(verified_stop_reason()))
+                .expect("record verified stop reason");
+            ledger
+                .apply_update(LedgerUpdate::UpdateTaskStatus(TaskStatusUpdate {
+                    task_id: task_id(),
+                    status: TaskStatus::Verified,
+                    updated_at: timestamp(13),
+                    updated_by: worker(),
+                    evidence_ids: Vec::new(),
+                    blocker_ids: Vec::new(),
+                    stop_reason_id: Some(verified_stop_reason_id()),
+                    verification_waiver_id: Some(waiver_id()),
+                    metadata: Metadata::new(),
+                }))
+                .expect_err("missing waiver fails")
+        };
+        assert!(matches!(
+            missing,
+            LedgerError::UnknownReference {
+                to: EntityRef::Waiver(_),
+                ..
+            }
+        ));
+
+        let wrong_scope = {
+            let mut ledger = fixture_ledger_with_task();
+            ledger
+                .apply_update(LedgerUpdate::RegisterTask(Task {
+                    id: other_task_id(),
+                    objective_id: objective_id(),
+                    title: "Other task".to_string(),
+                    description: None,
+                    status: TaskStatus::InProgress,
+                    status_updated_at: timestamp(1),
+                    dependencies: Vec::new(),
+                    blocker_ids: Vec::new(),
+                    evidence_ids: Vec::new(),
+                    artifact_ids: Vec::new(),
+                    checkpoint_ids: Vec::new(),
+                    metadata: Metadata::new(),
+                }))
+                .expect("register other task");
+            ledger
+                .apply_update(LedgerUpdate::RecordWaiver(task_waiver(
+                    waiver_id(),
+                    other_task_id(),
+                    None,
+                )))
+                .expect("record wrong-scope waiver");
+            ledger
+                .apply_update(LedgerUpdate::RecordStopReason(verified_stop_reason()))
+                .expect("record verified stop reason");
+            ledger
+                .apply_update(LedgerUpdate::UpdateTaskStatus(TaskStatusUpdate {
+                    task_id: task_id(),
+                    status: TaskStatus::Verified,
+                    updated_at: timestamp(13),
+                    updated_by: worker(),
+                    evidence_ids: Vec::new(),
+                    blocker_ids: Vec::new(),
+                    stop_reason_id: Some(verified_stop_reason_id()),
+                    verification_waiver_id: Some(waiver_id()),
+                    metadata: Metadata::new(),
+                }))
+                .expect_err("wrong-scope waiver fails")
+        };
+        assert!(matches!(
+            wrong_scope,
+            LedgerError::InvalidTaskTransition {
+                to: TaskStatus::Verified,
+                ..
+            }
+        ));
+
+        let expired = {
+            let mut ledger = fixture_ledger_with_task();
+            ledger
+                .apply_update(LedgerUpdate::RecordWaiver(task_waiver(
+                    waiver_id(),
+                    task_id(),
+                    Some(timestamp(12)),
+                )))
+                .expect("record expired waiver");
+            ledger
+                .apply_update(LedgerUpdate::RecordStopReason(verified_stop_reason()))
+                .expect("record verified stop reason");
+            ledger
+                .apply_update(LedgerUpdate::UpdateTaskStatus(TaskStatusUpdate {
+                    task_id: task_id(),
+                    status: TaskStatus::Verified,
+                    updated_at: timestamp(13),
+                    updated_by: worker(),
+                    evidence_ids: Vec::new(),
+                    blocker_ids: Vec::new(),
+                    stop_reason_id: Some(verified_stop_reason_id()),
+                    verification_waiver_id: Some(waiver_id()),
+                    metadata: Metadata::new(),
+                }))
+                .expect_err("expired waiver fails")
+        };
+        assert!(matches!(
+            expired,
+            LedgerError::InvalidTaskTransition {
+                to: TaskStatus::Verified,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn invalid_task_transitions_fail_loudly_without_mutating_history() {
+        let mut ledger = fixture_ledger_with_task();
+        ledger
+            .apply_update(LedgerUpdate::RecordEvidence(passed_task_evidence(
+                evidence_id(),
+            )))
+            .expect("record passed evidence");
+        ledger
+            .apply_update(LedgerUpdate::RecordStopReason(verified_stop_reason()))
+            .expect("record verified stop reason");
+        ledger
+            .apply_update(LedgerUpdate::UpdateTaskStatus(TaskStatusUpdate {
+                task_id: task_id(),
+                status: TaskStatus::Verified,
+                updated_at: timestamp(13),
+                updated_by: worker(),
+                evidence_ids: vec![evidence_id()],
+                blocker_ids: Vec::new(),
+                stop_reason_id: Some(verified_stop_reason_id()),
+                verification_waiver_id: None,
                 metadata: Metadata::new(),
             }))
             .expect("verify task");
@@ -2511,6 +2972,7 @@ mod tests {
                 evidence_ids: Vec::new(),
                 blocker_ids: Vec::new(),
                 stop_reason_id: None,
+                verification_waiver_id: None,
                 metadata: Metadata::new(),
             }))
             .expect_err("terminal verified task cannot reopen");
@@ -2528,10 +2990,7 @@ mod tests {
             ledger.tasks().get(&task_id()).expect("task exists").status,
             TaskStatus::Verified
         );
-        assert_eq!(
-            ledger.audit_evidence_graph().false_completed_task_ids,
-            vec![task_id()]
-        );
+        assert!(ledger.audit_evidence_graph().is_clean());
     }
 
     #[test]
@@ -2629,6 +3088,7 @@ mod tests {
                 evidence_ids: vec![evidence_id()],
                 blocker_ids: Vec::new(),
                 stop_reason_id: Some(verified_stop_reason_id()),
+                verification_waiver_id: None,
                 metadata: Metadata::new(),
             }))
             .expect("verify task with passed evidence");
@@ -2689,20 +3149,10 @@ mod tests {
             }))
             .expect("record orphan failed-attempt evidence");
         ledger
-            .apply_update(LedgerUpdate::RecordStopReason(verified_stop_reason()))
-            .expect("record verified stop reason");
-        ledger
-            .apply_update(LedgerUpdate::UpdateTaskStatus(TaskStatusUpdate {
-                task_id: task_id(),
-                status: TaskStatus::Verified,
-                updated_at: timestamp(13),
-                updated_by: worker(),
-                evidence_ids: Vec::new(),
-                blocker_ids: Vec::new(),
-                stop_reason_id: Some(verified_stop_reason_id()),
-                metadata: Metadata::new(),
-            }))
-            .expect("verified status remains representable for audit");
+            .tasks
+            .get_mut(&task_id())
+            .expect("task exists")
+            .status = TaskStatus::Verified;
 
         let audit = ledger.audit_evidence_graph();
         assert_eq!(audit.orphan_evidence_ids, vec![evidence_id()]);
@@ -2752,6 +3202,39 @@ mod tests {
                 metadata: Metadata::new(),
             }))
             .expect("record blocked stop reason");
+    }
+
+    fn passed_task_evidence(id: EvidenceId) -> Evidence {
+        evidence_with_result(id, EvidenceResult::Passed)
+    }
+
+    fn evidence_with_result(id: EvidenceId, result: EvidenceResult) -> Evidence {
+        Evidence {
+            id,
+            kind: EvidenceKind::Test,
+            summary: "Task acceptance probe evidence.".to_string(),
+            collected_at: timestamp(8),
+            collected_by: worker(),
+            result,
+            subjects: vec![EntityRef::Task(task_id())],
+            command: None,
+            source_refs: Vec::new(),
+            artifact_ids: Vec::new(),
+            metadata: Metadata::new(),
+        }
+    }
+
+    fn task_waiver(id: WaiverId, task_id: TaskId, expires_at: Option<DateTime<Utc>>) -> Waiver {
+        Waiver {
+            id,
+            waived_entity: EntityRef::Task(task_id),
+            reason: "Verifier accepted scoped manual waiver.".to_string(),
+            granted_by: worker(),
+            granted_at: timestamp(10),
+            expires_at,
+            evidence_id: None,
+            metadata: Metadata::new(),
+        }
     }
 
     fn verified_stop_reason() -> StopReasonRecord {
@@ -2849,6 +3332,7 @@ mod tests {
                 evidence_ids: vec![evidence_id()],
                 blocker_ids: Vec::new(),
                 stop_reason_id: Some(verified_stop_reason_id()),
+                verification_waiver_id: None,
                 metadata: Metadata::new(),
             }],
             blockers: Vec::new(),
@@ -2932,6 +3416,10 @@ mod tests {
 
     fn task_id() -> TaskId {
         TaskId::parse("task/ledger").unwrap()
+    }
+
+    fn other_task_id() -> TaskId {
+        TaskId::parse("task/other").unwrap()
     }
 
     fn evidence_id() -> EvidenceId {
