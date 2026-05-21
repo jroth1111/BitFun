@@ -1,0 +1,50 @@
+name: Cowork macOS CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+concurrency:
+  group: cowork-macos-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  macos-smoke:
+    name: Cowork Smoke (macOS)
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      CARGO_TARGET_DIR: target/cowork-smoke/cargo-target
+      CARGO_TERM_COLOR: always
+      TMPDIR: ${{ runner.temp }}/cowork-smoke-tmp
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          shared-key: cowork-macos-smoke-v1
+          cache-bin: false
+
+      - name: Run Cowork smoke
+        run: bash scripts/cowork-smoke.sh
+
+  windows-future:
+    name: Cowork Windows CI (future stub)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Document future Windows lane
+        run: |
+          printf '%s\n' 'Cowork Windows CI is intentionally not implemented here.'
+          printf '%s\n' 'macOS is the primary Cowork target; add windows-latest only with a dedicated acceptance plan.'
