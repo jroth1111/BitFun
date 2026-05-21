@@ -8,9 +8,9 @@
 //! Relationship model:
 //! - `RootScope` owns the immutable root objective, acceptance criteria, and
 //!   root constraints for a Cowork run.
-//! - `Task`, `Blocker`, `Evidence`, `Checkpoint`, `Artifact`, `SessionRecord`,
-//!   `StopReasonRecord`, `Waiver`, and `ProvenanceLink` records use typed stable
-//!   IDs and `EntityRef` edges to name relationships.
+//! - `Task`, `TaskTransition`, `Blocker`, `Evidence`, `Checkpoint`, `Artifact`,
+//!   `SessionRecord`, `StopReasonRecord`, `Waiver`, and `ProvenanceLink`
+//!   records use typed stable IDs and `EntityRef` edges to name relationships.
 //! - `CoworkLedger::apply_update` is the only mutation entry point. It validates
 //!   referenced entities before appending relationship edges, and it rejects any
 //!   compaction summary whose observed root scope differs from the initialized
@@ -155,6 +155,30 @@ pub enum LedgerError {
     TaskObjectiveMismatch {
         task_id: TaskId,
         objective_id: RootObjectiveId,
+    },
+    #[error("invalid task transition for '{task_id}' from {from:?} to {to:?}: {reason}")]
+    InvalidTaskTransition {
+        task_id: TaskId,
+        from: TaskStatus,
+        to: TaskStatus,
+        reason: &'static str,
+    },
+    #[error("task '{task_id}' transition to {status:?} requires a typed stop reason")]
+    MissingTaskStopReason { task_id: TaskId, status: TaskStatus },
+    #[error(
+        "task '{task_id}' transition to {status:?} requires stop reason kind {expected:?}, got {actual:?} from '{stop_reason_id}'"
+    )]
+    StopReasonKindMismatch {
+        task_id: TaskId,
+        stop_reason_id: StopReasonId,
+        status: TaskStatus,
+        expected: Vec<StopReasonKind>,
+        actual: StopReasonKind,
+    },
+    #[error("stop reason '{stop_reason_id}' does not name task '{task_id}' as a subject")]
+    StopReasonSubjectMismatch {
+        task_id: TaskId,
+        stop_reason_id: StopReasonId,
     },
     #[error(
         "root scope mutation rejected for {target:?}: current '{current}', attempted '{attempted}'"
@@ -466,6 +490,8 @@ pub struct CoworkLedger {
     root: RootScope,
     objective_progress: ObjectiveProgress,
     tasks: BTreeMap<TaskId, Task>,
+    #[serde(default)]
+    task_transitions: Vec<TaskTransition>,
     blockers: BTreeMap<BlockerId, Blocker>,
     evidence: BTreeMap<EvidenceId, Evidence>,
     checkpoints: BTreeMap<CheckpointId, Checkpoint>,
@@ -534,6 +560,7 @@ impl CoworkLedger {
                 metadata: Metadata::new(),
             },
             tasks: BTreeMap::new(),
+            task_transitions: Vec::new(),
             blockers: BTreeMap::new(),
             evidence: BTreeMap::new(),
             checkpoints: BTreeMap::new(),
@@ -564,6 +591,10 @@ impl CoworkLedger {
 
     pub fn tasks(&self) -> &BTreeMap<TaskId, Task> {
         &self.tasks
+    }
+
+    pub fn task_transitions(&self) -> &[TaskTransition] {
+        &self.task_transitions
     }
 
     pub fn blockers(&self) -> &BTreeMap<BlockerId, Blocker> {
@@ -700,14 +731,14 @@ impl CoworkLedger {
             applied.effects.push("checkpoint".to_string());
         }
 
-        for status_update in summary.task_status_updates {
-            self.update_task_status(status_update)?;
-            applied.effects.push("task_status".to_string());
-        }
-
         for stop_reason in summary.stop_reasons {
             self.record_stop_reason(stop_reason)?;
             applied.effects.push("stop_reason".to_string());
+        }
+
+        for status_update in summary.task_status_updates {
+            self.update_task_status(status_update)?;
+            applied.effects.push("task_status".to_string());
         }
 
         for waiver in summary.waivers {
@@ -744,26 +775,112 @@ impl CoworkLedger {
     }
 
     fn update_task_status(&mut self, update: TaskStatusUpdate) -> Result<(), LedgerError> {
-        if let Some(evidence_id) = &update.evidence_id {
+        let Some(existing_task) = self.tasks.get(&update.task_id) else {
+            return Err(LedgerError::UnknownReference {
+                from: update.subject_ref(),
+                to: EntityRef::Task(update.task_id),
+            });
+        };
+        let from_status = existing_task.status;
+
+        validate_task_transition(&update.task_id, from_status, update.status)?;
+        self.validate_task_stop_reason(&update)?;
+
+        for evidence_id in &update.evidence_ids {
             self.require_entity_exists(
                 &update.subject_ref(),
                 &EntityRef::Evidence(evidence_id.clone()),
             )?;
         }
 
-        let Some(task) = self.tasks.get_mut(&update.task_id) else {
-            return Err(LedgerError::UnknownReference {
-                from: update.subject_ref(),
-                to: EntityRef::Task(update.task_id),
-            });
+        for blocker_id in &update.blocker_ids {
+            self.require_entity_exists(
+                &update.subject_ref(),
+                &EntityRef::Blocker(blocker_id.clone()),
+            )?;
+        }
+
+        let sequence = self.task_transitions.len() as u64 + 1;
+        let transition = TaskTransition {
+            sequence,
+            task_id: update.task_id.clone(),
+            from_status,
+            to_status: update.status,
+            transitioned_at: update.updated_at,
+            transitioned_by: update.updated_by.clone(),
+            evidence_ids: update.evidence_ids.clone(),
+            blocker_ids: update.blocker_ids.clone(),
+            stop_reason_id: update.stop_reason_id.clone(),
+            metadata: update.metadata.clone(),
         };
 
+        let task = self
+            .tasks
+            .get_mut(&update.task_id)
+            .expect("task existence was validated before transition mutation");
         task.status = update.status;
         task.status_updated_at = update.updated_at;
-        if let Some(evidence_id) = update.evidence_id {
+        for evidence_id in update.evidence_ids {
             push_unique(&mut task.evidence_ids, evidence_id);
         }
+        for blocker_id in update.blocker_ids {
+            push_unique(&mut task.blocker_ids, blocker_id);
+        }
+        self.task_transitions.push(transition);
         Ok(())
+    }
+
+    fn validate_task_stop_reason(&self, update: &TaskStatusUpdate) -> Result<(), LedgerError> {
+        let expected_kinds = expected_stop_reason_kinds_for_task_status(update.status);
+
+        match (&update.stop_reason_id, expected_kinds.is_empty()) {
+            (None, false) => Err(LedgerError::MissingTaskStopReason {
+                task_id: update.task_id.clone(),
+                status: update.status,
+            }),
+            (Some(_stop_reason_id), true) => Err(LedgerError::InvalidTaskTransition {
+                task_id: update.task_id.clone(),
+                from: self
+                    .tasks
+                    .get(&update.task_id)
+                    .expect("task existence was validated before stop reason validation")
+                    .status,
+                to: update.status,
+                reason: "stop reason is only valid for stopped task states",
+            }),
+            (Some(stop_reason_id), false) => {
+                let stop_reason = self.stop_reasons.get(stop_reason_id).ok_or_else(|| {
+                    LedgerError::UnknownReference {
+                        from: update.subject_ref(),
+                        to: EntityRef::StopReason(stop_reason_id.clone()),
+                    }
+                })?;
+
+                if !expected_kinds.contains(&stop_reason.kind) {
+                    return Err(LedgerError::StopReasonKindMismatch {
+                        task_id: update.task_id.clone(),
+                        stop_reason_id: stop_reason_id.clone(),
+                        status: update.status,
+                        expected: expected_kinds.to_vec(),
+                        actual: stop_reason.kind,
+                    });
+                }
+
+                if !stop_reason
+                    .subjects
+                    .iter()
+                    .any(|subject| subject == &EntityRef::Task(update.task_id.clone()))
+                {
+                    return Err(LedgerError::StopReasonSubjectMismatch {
+                        task_id: update.task_id.clone(),
+                        stop_reason_id: stop_reason_id.clone(),
+                    });
+                }
+
+                Ok(())
+            }
+            (None, true) => Ok(()),
+        }
     }
 
     fn update_objective_progress(
@@ -1133,14 +1250,40 @@ pub struct TaskStatusUpdate {
     pub task_id: TaskId,
     pub status: TaskStatus,
     pub updated_at: DateTime<Utc>,
+    pub updated_by: ActorRef,
+    #[serde(default)]
+    pub evidence_ids: Vec<EvidenceId>,
+    #[serde(default)]
+    pub blocker_ids: Vec<BlockerId>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub evidence_id: Option<EvidenceId>,
+    pub stop_reason_id: Option<StopReasonId>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: Metadata,
 }
 
 impl TaskStatusUpdate {
     fn subject_ref(&self) -> EntityRef {
         EntityRef::Task(self.task_id.clone())
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskTransition {
+    pub sequence: u64,
+    pub task_id: TaskId,
+    pub from_status: TaskStatus,
+    pub to_status: TaskStatus,
+    pub transitioned_at: DateTime<Utc>,
+    pub transitioned_by: ActorRef,
+    #[serde(default)]
+    pub evidence_ids: Vec<EvidenceId>,
+    #[serde(default)]
+    pub blocker_ids: Vec<BlockerId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_reason_id: Option<StopReasonId>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: Metadata,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1357,6 +1500,7 @@ pub enum StopReasonKind {
     SessionCapacityReached,
     BlockedExternalInput,
     EnvironmentDegraded,
+    Descoped,
     Cancelled,
     Failed,
 }
@@ -1487,6 +1631,85 @@ fn require_text(field: &'static str, value: &str) -> Result<(), LedgerError> {
         Err(LedgerError::EmptyText { field })
     } else {
         Ok(())
+    }
+}
+
+fn validate_task_transition(
+    task_id: &TaskId,
+    from: TaskStatus,
+    to: TaskStatus,
+) -> Result<(), LedgerError> {
+    if from == to {
+        return Err(LedgerError::InvalidTaskTransition {
+            task_id: task_id.clone(),
+            from,
+            to,
+            reason: "task status is unchanged",
+        });
+    }
+
+    let allowed = match from {
+        TaskStatus::NotStarted => matches!(
+            to,
+            TaskStatus::InProgress
+                | TaskStatus::Blocked
+                | TaskStatus::Descoped
+                | TaskStatus::Cancelled
+        ),
+        TaskStatus::InProgress => matches!(
+            to,
+            TaskStatus::Blocked
+                | TaskStatus::ImplementedUnverified
+                | TaskStatus::Verified
+                | TaskStatus::Descoped
+                | TaskStatus::Cancelled
+                | TaskStatus::Failed
+        ),
+        TaskStatus::Blocked => matches!(
+            to,
+            TaskStatus::InProgress
+                | TaskStatus::Descoped
+                | TaskStatus::Cancelled
+                | TaskStatus::Failed
+        ),
+        TaskStatus::ImplementedUnverified => matches!(
+            to,
+            TaskStatus::InProgress
+                | TaskStatus::Blocked
+                | TaskStatus::Verified
+                | TaskStatus::Descoped
+                | TaskStatus::Cancelled
+                | TaskStatus::Failed
+        ),
+        TaskStatus::Verified
+        | TaskStatus::Descoped
+        | TaskStatus::Cancelled
+        | TaskStatus::Failed => false,
+    };
+
+    if allowed {
+        Ok(())
+    } else {
+        Err(LedgerError::InvalidTaskTransition {
+            task_id: task_id.clone(),
+            from,
+            to,
+            reason: "transition is not allowed by task status state machine",
+        })
+    }
+}
+
+fn expected_stop_reason_kinds_for_task_status(status: TaskStatus) -> &'static [StopReasonKind] {
+    match status {
+        TaskStatus::Blocked => &[
+            StopReasonKind::BlockedExternalInput,
+            StopReasonKind::EnvironmentDegraded,
+        ],
+        TaskStatus::Verified => &[StopReasonKind::Verified],
+        TaskStatus::Descoped => &[StopReasonKind::Descoped],
+        TaskStatus::Cancelled => &[StopReasonKind::Cancelled],
+        TaskStatus::Failed => &[StopReasonKind::Failed],
+        TaskStatus::NotStarted | TaskStatus::InProgress | TaskStatus::ImplementedUnverified => &[],
     }
 }
 
@@ -1640,9 +1863,142 @@ mod tests {
             ledger.tasks().get(&task_id()).expect("task exists").status,
             TaskStatus::Verified
         );
+        assert_eq!(ledger.task_transitions().len(), 1);
+        assert_eq!(
+            ledger.task_transitions()[0].stop_reason_id,
+            Some(verified_stop_reason_id())
+        );
         assert!(ledger.evidence().contains_key(&evidence_id()));
         assert!(ledger.checkpoints().contains_key(&checkpoint_id()));
         assert!(ledger.provenance_links().contains_key(&link_id()));
+    }
+
+    #[test]
+    fn task_status_updates_persist_complete_transition_history_and_export() {
+        let mut ledger = fixture_ledger_with_task();
+        record_blocked_transition_inputs(&mut ledger);
+
+        ledger
+            .apply_update(LedgerUpdate::UpdateTaskStatus(TaskStatusUpdate {
+                task_id: task_id(),
+                status: TaskStatus::Blocked,
+                updated_at: timestamp(11),
+                updated_by: worker(),
+                evidence_ids: vec![evidence_id()],
+                blocker_ids: vec![blocker_id()],
+                stop_reason_id: Some(blocked_stop_reason_id()),
+                metadata: Metadata::new(),
+            }))
+            .expect("blocked transition records complete context");
+
+        let task = ledger.tasks().get(&task_id()).expect("task exists");
+        assert_eq!(task.status, TaskStatus::Blocked);
+        assert_eq!(task.evidence_ids, vec![evidence_id()]);
+        assert_eq!(task.blocker_ids, vec![blocker_id()]);
+
+        let transition = ledger
+            .task_transitions()
+            .first()
+            .expect("transition is persisted");
+        assert_eq!(transition.sequence, 1);
+        assert_eq!(transition.task_id, task_id());
+        assert_eq!(transition.from_status, TaskStatus::InProgress);
+        assert_eq!(transition.to_status, TaskStatus::Blocked);
+        assert_eq!(transition.transitioned_by, worker());
+        assert_eq!(transition.evidence_ids, vec![evidence_id()]);
+        assert_eq!(transition.blocker_ids, vec![blocker_id()]);
+        assert_eq!(transition.stop_reason_id, Some(blocked_stop_reason_id()));
+
+        let exported = serde_json::to_value(&ledger).expect("export ledger");
+        assert_eq!(
+            exported["taskTransitions"]
+                .as_array()
+                .expect("transition history exported")
+                .len(),
+            1
+        );
+
+        let roundtripped: CoworkLedger =
+            serde_json::from_value(exported).expect("reimport exported ledger");
+        assert_eq!(roundtripped.task_transitions(), ledger.task_transitions());
+    }
+
+    #[test]
+    fn stopped_task_status_requires_typed_stop_reason() {
+        let mut ledger = fixture_ledger_with_task();
+
+        let error = ledger
+            .apply_update(LedgerUpdate::UpdateTaskStatus(TaskStatusUpdate {
+                task_id: task_id(),
+                status: TaskStatus::Verified,
+                updated_at: timestamp(12),
+                updated_by: worker(),
+                evidence_ids: Vec::new(),
+                blocker_ids: Vec::new(),
+                stop_reason_id: None,
+                metadata: Metadata::new(),
+            }))
+            .expect_err("verified task transition requires typed stop reason");
+
+        assert!(matches!(
+            error,
+            LedgerError::MissingTaskStopReason {
+                status: TaskStatus::Verified,
+                ..
+            }
+        ));
+        assert!(ledger.task_transitions().is_empty());
+        assert_eq!(
+            ledger.tasks().get(&task_id()).expect("task exists").status,
+            TaskStatus::InProgress
+        );
+    }
+
+    #[test]
+    fn invalid_task_transitions_fail_loudly_without_mutating_history() {
+        let mut ledger = fixture_ledger_with_task();
+        ledger
+            .apply_update(LedgerUpdate::RecordStopReason(verified_stop_reason()))
+            .expect("record verified stop reason");
+        ledger
+            .apply_update(LedgerUpdate::UpdateTaskStatus(TaskStatusUpdate {
+                task_id: task_id(),
+                status: TaskStatus::Verified,
+                updated_at: timestamp(13),
+                updated_by: worker(),
+                evidence_ids: Vec::new(),
+                blocker_ids: Vec::new(),
+                stop_reason_id: Some(verified_stop_reason_id()),
+                metadata: Metadata::new(),
+            }))
+            .expect("verify task");
+
+        let error = ledger
+            .apply_update(LedgerUpdate::UpdateTaskStatus(TaskStatusUpdate {
+                task_id: task_id(),
+                status: TaskStatus::InProgress,
+                updated_at: timestamp(14),
+                updated_by: worker(),
+                evidence_ids: Vec::new(),
+                blocker_ids: Vec::new(),
+                stop_reason_id: None,
+                metadata: Metadata::new(),
+            }))
+            .expect_err("terminal verified task cannot reopen");
+
+        assert!(matches!(
+            error,
+            LedgerError::InvalidTaskTransition {
+                from: TaskStatus::Verified,
+                to: TaskStatus::InProgress,
+                ..
+            }
+        ));
+        assert_eq!(ledger.task_transitions().len(), 1);
+        assert_eq!(
+            ledger.tasks().get(&task_id()).expect("task exists").status,
+            TaskStatus::Verified
+        );
     }
 
     #[test]
@@ -1661,6 +2017,61 @@ mod tests {
             .expect_err("link to missing entities fails");
 
         assert!(matches!(error, LedgerError::UnknownReference { .. }));
+    }
+
+    fn record_blocked_transition_inputs(ledger: &mut CoworkLedger) {
+        ledger
+            .apply_update(LedgerUpdate::RecordEvidence(Evidence {
+                id: evidence_id(),
+                kind: EvidenceKind::Test,
+                summary: "Task cannot proceed until external input is available.".to_string(),
+                collected_at: timestamp(8),
+                collected_by: worker(),
+                result: EvidenceResult::Blocked,
+                subjects: vec![EntityRef::Task(task_id())],
+                command: None,
+                artifact_ids: Vec::new(),
+                metadata: Metadata::new(),
+            }))
+            .expect("record evidence");
+
+        ledger
+            .apply_update(LedgerUpdate::RecordBlocker(Blocker {
+                id: blocker_id(),
+                summary: "Awaiting approval artifact.".to_string(),
+                status: BlockerStatus::Open,
+                opened_at: timestamp(9),
+                resolved_at: None,
+                task_ids: vec![task_id()],
+                required_external_input: vec!["approval artifact".to_string()],
+                evidence_ids: vec![evidence_id()],
+                metadata: Metadata::new(),
+            }))
+            .expect("record blocker");
+
+        ledger
+            .apply_update(LedgerUpdate::RecordStopReason(StopReasonRecord {
+                id: blocked_stop_reason_id(),
+                kind: StopReasonKind::BlockedExternalInput,
+                summary: "Blocked until approval artifact is supplied.".to_string(),
+                recorded_at: timestamp(10),
+                recorded_by: worker(),
+                subjects: vec![EntityRef::Task(task_id())],
+                metadata: Metadata::new(),
+            }))
+            .expect("record blocked stop reason");
+    }
+
+    fn verified_stop_reason() -> StopReasonRecord {
+        StopReasonRecord {
+            id: verified_stop_reason_id(),
+            kind: StopReasonKind::Verified,
+            summary: "Task satisfied acceptance probes.".to_string(),
+            recorded_at: timestamp(5),
+            recorded_by: worker(),
+            subjects: vec![EntityRef::Task(task_id())],
+            metadata: Metadata::new(),
+        }
     }
 
     fn fixture_ledger_with_task() -> CoworkLedger {
@@ -1698,7 +2109,11 @@ mod tests {
                 task_id: task_id(),
                 status: TaskStatus::Verified,
                 updated_at: timestamp(6),
-                evidence_id: Some(evidence_id()),
+                updated_by: worker(),
+                evidence_ids: vec![evidence_id()],
+                blocker_ids: Vec::new(),
+                stop_reason_id: Some(verified_stop_reason_id()),
+                metadata: Metadata::new(),
             }],
             blockers: Vec::new(),
             evidence: vec![Evidence {
@@ -1728,7 +2143,7 @@ mod tests {
                 metadata: Metadata::new(),
             }],
             artifacts: Vec::new(),
-            stop_reasons: Vec::new(),
+            stop_reasons: vec![verified_stop_reason()],
             waivers: Vec::new(),
             provenance_links: vec![ProvenanceLink {
                 id: link_id(),
@@ -1783,6 +2198,18 @@ mod tests {
 
     fn evidence_id() -> EvidenceId {
         EvidenceId::parse("evidence/compaction").unwrap()
+    }
+
+    fn blocker_id() -> BlockerId {
+        BlockerId::parse("blocker/approval").unwrap()
+    }
+
+    fn verified_stop_reason_id() -> StopReasonId {
+        StopReasonId::parse("stop/verified").unwrap()
+    }
+
+    fn blocked_stop_reason_id() -> StopReasonId {
+        StopReasonId::parse("stop/blocked-external-input").unwrap()
     }
 
     fn checkpoint_id() -> CheckpointId {
