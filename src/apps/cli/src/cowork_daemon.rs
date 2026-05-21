@@ -1,9 +1,10 @@
 use clap::{Args, Subcommand};
 use cowork_protocol::{
-    Artifact, ArtifactKind, ArtifactProvenance, AuthorityInvariant, BrowserState, BrowserStatus,
-    Checkpoint, CoworkSnapshot, Evidence, EvidenceKind, Metadata, Objective, ObjectiveStatus,
-    ProtocolEnvelope, ProtocolError, ProtocolErrorCode, ProtocolVersion, RunStatus, Task,
-    TaskStatus,
+    Artifact, ArtifactKind, ArtifactProvenance, AuthorityInvariant, BrowserAdapter, BrowserSession,
+    BrowserState, BrowserStatus, BrowserTab, Checkpoint, CoworkSnapshot, Evidence, EvidenceKind,
+    Metadata, Objective, ObjectiveStatus, ProtocolEnvelope, ProtocolError, ProtocolErrorCode,
+    ProtocolVersion, Provider, ProviderCapability, ProviderKind, ProviderStatus, RunStatus,
+    Subagent, SubagentStatus, Task, TaskStatus,
 };
 use serde::Serialize;
 use std::error::Error;
@@ -19,8 +20,8 @@ pub enum DaemonAction {
     Start(DaemonSmokeOptions),
     /// Report run status from the deterministic smoke daemon
     Status(DaemonSmokeOptions),
-    /// Export the deterministic CoworkSnapshot smoke state
-    Export(DaemonSmokeOptions),
+    /// Export the deterministic CoworkSnapshot smoke state as JSON or Markdown
+    Export(DaemonExportOptions),
 }
 
 #[derive(Debug, Clone, Args, PartialEq, Eq)]
@@ -43,11 +44,55 @@ impl Default for DaemonSmokeOptions {
     }
 }
 
+#[derive(Debug, Clone, Args, PartialEq, Eq)]
+pub struct DaemonExportOptions {
+    #[command(flatten)]
+    pub smoke: DaemonSmokeOptions,
+
+    /// Export format. Supported values: json, markdown.
+    #[arg(long, default_value = "json")]
+    pub format: String,
+}
+
+impl Default for DaemonExportOptions {
+    fn default() -> Self {
+        Self {
+            smoke: DaemonSmokeOptions::default(),
+            format: DaemonExportFormat::Json.as_str().to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DaemonExportFormat {
+    Json,
+    Markdown,
+}
+
+impl DaemonExportFormat {
+    fn parse(input: &str) -> Result<Self, CoworkDaemonSmokeError> {
+        match input {
+            "json" => Ok(Self::Json),
+            "markdown" | "md" => Ok(Self::Markdown),
+            format => Err(CoworkDaemonSmokeError::UnsupportedExportFormat {
+                format: format.to_string(),
+            }),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Json => "json",
+            Self::Markdown => "markdown",
+        }
+    }
+}
+
 pub fn run_action(action: DaemonAction) -> Result<String, CoworkDaemonSmokeError> {
     match action {
         DaemonAction::Start(options) => to_pretty_json(&start_output(options)?),
         DaemonAction::Status(options) => to_pretty_json(&status_output(options)?),
-        DaemonAction::Export(options) => to_pretty_json(&export_snapshot(options)?),
+        DaemonAction::Export(options) => export_output(options),
     }
 }
 
@@ -96,6 +141,16 @@ fn export_snapshot(options: DaemonSmokeOptions) -> Result<CoworkSnapshot, Cowork
     start_and_connect(request)
 }
 
+fn export_output(options: DaemonExportOptions) -> Result<String, CoworkDaemonSmokeError> {
+    let format = DaemonExportFormat::parse(&options.format)?;
+    let snapshot = export_snapshot(options.smoke)?;
+
+    match format {
+        DaemonExportFormat::Json => to_pretty_json(&snapshot),
+        DaemonExportFormat::Markdown => Ok(render_snapshot_markdown(&snapshot)),
+    }
+}
+
 fn start_and_connect(
     request: SmokeDaemonRequest,
 ) -> Result<CoworkSnapshot, CoworkDaemonSmokeError> {
@@ -106,6 +161,261 @@ fn start_and_connect(
 
 fn to_pretty_json<T: Serialize>(value: &T) -> Result<String, CoworkDaemonSmokeError> {
     serde_json::to_string_pretty(value).map_err(CoworkDaemonSmokeError::serialization)
+}
+
+fn render_snapshot_markdown(snapshot: &CoworkSnapshot) -> String {
+    let mut markdown = String::new();
+
+    markdown.push_str("# Cowork Run Ledger Export\n\n");
+    markdown.push_str("## Run\n\n");
+    markdown.push_str(&format!(
+        "- Status: `{}`\n- Protocol: `{}.{}.{}`\n- Authority: daemon-authored\n\n",
+        json_label(&snapshot.run_status),
+        snapshot.protocol_version.major,
+        snapshot.protocol_version.minor,
+        snapshot.protocol_version.patch
+    ));
+
+    markdown.push_str("## Objective\n\n");
+    markdown.push_str(&format!(
+        "- ID: `{}`\n- Status: `{}`\n- Instruction: {}\n",
+        escape_inline(&snapshot.objective.id),
+        json_label(&snapshot.objective.status),
+        escape_inline(&snapshot.objective.instruction)
+    ));
+    if !snapshot.objective.constraints.is_empty() {
+        markdown.push_str("- Constraints:\n");
+        for constraint in &snapshot.objective.constraints {
+            markdown.push_str(&format!("  - {}\n", escape_inline(constraint)));
+        }
+    }
+    if !snapshot.objective.acceptance_criteria.is_empty() {
+        markdown.push_str("- Acceptance criteria:\n");
+        for criterion in &snapshot.objective.acceptance_criteria {
+            markdown.push_str(&format!("  - {}\n", escape_inline(criterion)));
+        }
+    }
+    markdown.push('\n');
+
+    render_tasks(&mut markdown, &snapshot.tasks);
+    render_evidence(&mut markdown, &snapshot.evidence);
+    render_checkpoints(&mut markdown, &snapshot.checkpoints);
+    render_artifacts(&mut markdown, &snapshot.artifacts);
+    render_browser(&mut markdown, &snapshot.browser);
+    render_providers(&mut markdown, &snapshot.providers);
+    render_subagents(&mut markdown, &snapshot.subagents);
+
+    markdown
+}
+
+fn render_tasks(markdown: &mut String, tasks: &[Task]) {
+    markdown.push_str("## Tasks\n\n");
+    if tasks.is_empty() {
+        markdown.push_str("_No tasks recorded._\n\n");
+        return;
+    }
+
+    markdown.push_str("| ID | Status | Title | Evidence | Artifacts | Subagent |\n");
+    markdown.push_str("| --- | --- | --- | --- | --- | --- |\n");
+    for task in tasks {
+        markdown.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} |\n",
+            escape_cell(&task.id),
+            escape_cell(json_label(&task.status)),
+            escape_cell(&task.title),
+            escape_cell(join_or_none(&task.evidence_ids)),
+            escape_cell(join_or_none(&task.artifact_ids)),
+            escape_cell(task.assigned_subagent_id.as_deref().unwrap_or("none"))
+        ));
+    }
+    markdown.push('\n');
+}
+
+fn render_evidence(markdown: &mut String, evidence: &[Evidence]) {
+    markdown.push_str("## Evidence\n\n");
+    if evidence.is_empty() {
+        markdown.push_str("_No evidence recorded._\n\n");
+        return;
+    }
+
+    markdown.push_str("| ID | Kind | Task | Checkpoint | Summary |\n");
+    markdown.push_str("| --- | --- | --- | --- | --- |\n");
+    for item in evidence {
+        markdown.push_str(&format!(
+            "| {} | {} | {} | {} | {} |\n",
+            escape_cell(&item.id),
+            escape_cell(json_label(&item.kind)),
+            escape_cell(item.task_id.as_deref().unwrap_or("none")),
+            escape_cell(item.checkpoint_id.as_deref().unwrap_or("none")),
+            escape_cell(&item.summary)
+        ));
+    }
+    markdown.push('\n');
+}
+
+fn render_checkpoints(markdown: &mut String, checkpoints: &[Checkpoint]) {
+    markdown.push_str("## Checkpoints\n\n");
+    if checkpoints.is_empty() {
+        markdown.push_str("_No checkpoints recorded._\n\n");
+        return;
+    }
+
+    markdown.push_str("| Sequence | ID | Summary | Tasks | Evidence | Artifacts |\n");
+    markdown.push_str("| --- | --- | --- | --- | --- | --- |\n");
+    for checkpoint in checkpoints {
+        markdown.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} |\n",
+            checkpoint.sequence,
+            escape_cell(&checkpoint.id),
+            escape_cell(&checkpoint.summary),
+            escape_cell(join_or_none(&checkpoint.task_ids)),
+            escape_cell(join_or_none(&checkpoint.evidence_ids)),
+            escape_cell(join_or_none(&checkpoint.artifact_ids))
+        ));
+    }
+    markdown.push('\n');
+}
+
+fn render_artifacts(markdown: &mut String, artifacts: &[Artifact]) {
+    markdown.push_str("## Artifacts\n\n");
+    if artifacts.is_empty() {
+        markdown.push_str("_No artifacts recorded._\n\n");
+        return;
+    }
+
+    markdown.push_str("| ID | Kind | Title | URI | Evidence |\n");
+    markdown.push_str("| --- | --- | --- | --- | --- |\n");
+    for artifact in artifacts {
+        markdown.push_str(&format!(
+            "| {} | {} | {} | {} | {} |\n",
+            escape_cell(&artifact.id),
+            escape_cell(json_label(&artifact.kind)),
+            escape_cell(&artifact.title),
+            escape_cell(artifact.uri.as_deref().unwrap_or("none")),
+            escape_cell(join_or_none(&artifact.evidence_ids))
+        ));
+    }
+    markdown.push('\n');
+}
+
+fn render_browser(markdown: &mut String, browser: &BrowserState) {
+    markdown.push_str("## Browser\n\n");
+    markdown.push_str(&format!(
+        "- Status: `{}`\n- Active session: `{}`\n\n",
+        json_label(&browser.status),
+        escape_inline(browser.active_session_id.as_deref().unwrap_or("none"))
+    ));
+
+    if browser.sessions.is_empty() {
+        markdown.push_str("_No browser sessions recorded._\n\n");
+        return;
+    }
+
+    markdown.push_str("| Session | Adapter | Status | Active tab | Tabs |\n");
+    markdown.push_str("| --- | --- | --- | --- | --- |\n");
+    for session in &browser.sessions {
+        let tabs = session
+            .tabs
+            .iter()
+            .map(|tab| {
+                format!(
+                    "{} ({})",
+                    tab.id,
+                    tab.url
+                        .as_deref()
+                        .unwrap_or(tab.title.as_deref().unwrap_or("untitled"))
+                )
+            })
+            .collect::<Vec<_>>();
+        markdown.push_str(&format!(
+            "| {} | {} | {} | {} | {} |\n",
+            escape_cell(&session.id),
+            escape_cell(json_label(&session.adapter)),
+            escape_cell(json_label(&session.status)),
+            escape_cell(session.active_tab_id.as_deref().unwrap_or("none")),
+            escape_cell(join_or_none(&tabs))
+        ));
+    }
+    markdown.push('\n');
+}
+
+fn render_providers(markdown: &mut String, providers: &[Provider]) {
+    markdown.push_str("## Providers\n\n");
+    if providers.is_empty() {
+        markdown.push_str("_No providers recorded._\n\n");
+        return;
+    }
+
+    markdown.push_str("| ID | Kind | Label | Status | Model | Capabilities |\n");
+    markdown.push_str("| --- | --- | --- | --- | --- | --- |\n");
+    for provider in providers {
+        let capabilities = provider
+            .capabilities
+            .iter()
+            .map(json_label)
+            .collect::<Vec<_>>();
+        markdown.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} |\n",
+            escape_cell(&provider.id),
+            escape_cell(json_label(&provider.kind)),
+            escape_cell(&provider.label),
+            escape_cell(json_label(&provider.status)),
+            escape_cell(provider.selected_model.as_deref().unwrap_or("none")),
+            escape_cell(join_or_none(&capabilities))
+        ));
+    }
+    markdown.push('\n');
+}
+
+fn render_subagents(markdown: &mut String, subagents: &[Subagent]) {
+    markdown.push_str("## Subagents\n\n");
+    if subagents.is_empty() {
+        markdown.push_str("_No subagents recorded._\n\n");
+        return;
+    }
+
+    markdown.push_str("| ID | Name | Role | Status | Parent task | Report evidence |\n");
+    markdown.push_str("| --- | --- | --- | --- | --- | --- |\n");
+    for subagent in subagents {
+        markdown.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} |\n",
+            escape_cell(&subagent.id),
+            escape_cell(&subagent.name),
+            escape_cell(&subagent.role),
+            escape_cell(json_label(&subagent.status)),
+            escape_cell(subagent.parent_task_id.as_deref().unwrap_or("none")),
+            escape_cell(subagent.report_evidence_id.as_deref().unwrap_or("none"))
+        ));
+    }
+    markdown.push('\n');
+}
+
+fn json_label<T: Serialize>(value: T) -> String {
+    match serde_json::to_value(value) {
+        Ok(serde_json::Value::String(label)) => label,
+        Ok(other) => other.to_string(),
+        Err(_) => "unknown".to_string(),
+    }
+}
+
+fn join_or_none(values: &[String]) -> String {
+    if values.is_empty() {
+        "none".to_string()
+    } else {
+        values.join(", ")
+    }
+}
+
+fn escape_inline(value: &str) -> String {
+    value.replace('\n', " ")
+}
+
+fn escape_cell(value: impl AsRef<str>) -> String {
+    value
+        .as_ref()
+        .replace('\\', "\\\\")
+        .replace('|', "\\|")
+        .replace('\n', "<br>")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -258,6 +568,10 @@ impl LocalSmokeDaemon {
         let evidence_id = "cowork-smoke-evidence".to_string();
         let checkpoint_id = "cowork-smoke-checkpoint".to_string();
         let artifact_id = "cowork-smoke-snapshot".to_string();
+        let subagent_id = "cowork-smoke-worker".to_string();
+        let provider_id = "cowork-smoke-provider".to_string();
+        let browser_session_id = "cowork-smoke-browser".to_string();
+        let browser_tab_id = "cowork-smoke-tab".to_string();
 
         CoworkSnapshot {
             protocol_version: ProtocolVersion::current(),
@@ -285,7 +599,7 @@ impl LocalSmokeDaemon {
                 dependencies: Vec::new(),
                 evidence_ids: vec![evidence_id.clone()],
                 artifact_ids: vec![artifact_id.clone()],
-                assigned_subagent_id: None,
+                assigned_subagent_id: Some(subagent_id.clone()),
                 metadata: self.metadata(),
             }],
             evidence: vec![Evidence {
@@ -315,20 +629,51 @@ impl LocalSmokeDaemon {
                 kind: ArtifactKind::Json,
                 title: "Cowork smoke daemon snapshot".to_string(),
                 uri: None,
-                evidence_ids: vec![evidence_id],
+                evidence_ids: vec![evidence_id.clone()],
                 provenance: ArtifactProvenance {
                     objective_id,
-                    task_id: Some(task_id),
+                    task_id: Some(task_id.clone()),
                     evidence_id: Some("cowork-smoke-evidence".to_string()),
                 },
                 metadata: self.metadata(),
             }],
-            subagents: Vec::new(),
-            providers: Vec::new(),
+            subagents: vec![Subagent {
+                id: subagent_id.clone(),
+                name: "smoke-worker".to_string(),
+                role: "Exercise the deterministic daemon export boundary.".to_string(),
+                status: SubagentStatus::Running,
+                parent_task_id: Some(task_id.clone()),
+                report_evidence_id: Some(evidence_id.clone()),
+                allowed_tools: vec!["daemon.status".to_string(), "daemon.export".to_string()],
+                denied_tools: Vec::new(),
+                metadata: self.metadata(),
+            }],
+            providers: vec![Provider {
+                id: provider_id,
+                kind: ProviderKind::OpenAiCompatible,
+                label: "smoke provider".to_string(),
+                status: ProviderStatus::Available,
+                selected_model: Some("cowork-smoke-model".to_string()),
+                capabilities: vec![ProviderCapability::Text, ProviderCapability::ToolUse],
+                credential_ref: None,
+                metadata: self.metadata(),
+            }],
             browser: BrowserState {
-                sessions: Vec::new(),
-                active_session_id: None,
-                status: BrowserStatus::Unavailable,
+                sessions: vec![BrowserSession {
+                    id: browser_session_id.clone(),
+                    adapter: BrowserAdapter::ManagedProfileCdp,
+                    status: BrowserStatus::Running,
+                    profile_id: Some("cowork-smoke-profile".to_string()),
+                    active_tab_id: Some(browser_tab_id.clone()),
+                    tabs: vec![BrowserTab {
+                        id: browser_tab_id,
+                        title: Some("Cowork smoke".to_string()),
+                        url: Some("https://example.test/cowork-smoke".to_string()),
+                        task_id: Some(task_id),
+                    }],
+                }],
+                active_session_id: Some(browser_session_id),
+                status: BrowserStatus::Running,
                 metadata: self.metadata(),
             },
             run_status: RunStatus::Running,
@@ -358,6 +703,7 @@ impl LocalSmokeDaemon {
 pub enum CoworkDaemonSmokeError {
     UnsupportedEndpoint { endpoint: String },
     UnsupportedTarget { target: String },
+    UnsupportedExportFormat { format: String },
     NotStarted,
     Serialization { message: String },
 }
@@ -367,6 +713,7 @@ impl CoworkDaemonSmokeError {
         match self {
             Self::UnsupportedEndpoint { .. } => "unsupported_endpoint",
             Self::UnsupportedTarget { .. } => "unsupported_target",
+            Self::UnsupportedExportFormat { .. } => "unsupported_export_format",
             Self::NotStarted => "daemon_not_started",
             Self::Serialization { .. } => "serialization_failed",
         }
@@ -382,6 +729,11 @@ impl CoworkDaemonSmokeError {
             Self::UnsupportedTarget { target } => ProtocolError::InvalidRequest {
                 message: format!(
                     "unsupported Cowork smoke daemon target '{target}'; supported target is '{SUPPORTED_TARGET}'"
+                ),
+            },
+            Self::UnsupportedExportFormat { format } => ProtocolError::InvalidRequest {
+                message: format!(
+                    "unsupported Cowork daemon export format '{format}'; supported formats are 'json' and 'markdown'"
                 ),
             },
             Self::NotStarted => ProtocolError::Conflict {
@@ -421,6 +773,12 @@ impl fmt::Display for CoworkDaemonSmokeError {
                 write!(
                     formatter,
                     "unsupported Cowork smoke daemon target '{target}'"
+                )
+            }
+            Self::UnsupportedExportFormat { format } => {
+                write!(
+                    formatter,
+                    "unsupported Cowork daemon export format '{format}'"
                 )
             }
             Self::NotStarted => formatter.write_str("Cowork smoke daemon has not been started"),
@@ -485,6 +843,9 @@ mod tests {
             AuthorityInvariant::daemon_authoritative()
         );
         assert_eq!(connection.snapshot.objective.id, "cowork-smoke-objective");
+        assert_eq!(connection.snapshot.subagents.len(), 1);
+        assert_eq!(connection.snapshot.providers.len(), 1);
+        assert_eq!(connection.snapshot.browser.sessions.len(), 1);
     }
 
     #[test]
@@ -521,11 +882,110 @@ mod tests {
         assert_eq!(status_value["runStatus"], "running");
 
         let export_json =
-            run_action(DaemonAction::Export(DaemonSmokeOptions::default())).expect("export json");
+            run_action(DaemonAction::Export(DaemonExportOptions::default())).expect("export json");
         let export_value: serde_json::Value =
             serde_json::from_str(&export_json).expect("parse export json");
         assert_eq!(export_value["runStatus"], "running");
         assert_eq!(export_value["protocolVersion"]["major"], 1);
+        assert_eq!(export_value["subagents"][0]["id"], "cowork-smoke-worker");
+        assert_eq!(export_value["providers"][0]["id"], "cowork-smoke-provider");
+        assert_eq!(
+            export_value["browser"]["sessions"][0]["id"],
+            "cowork-smoke-browser"
+        );
+    }
+
+    #[test]
+    fn export_json_format_is_explicit_and_default_stable() {
+        let default_json =
+            run_action(DaemonAction::Export(DaemonExportOptions::default())).expect("export json");
+        let explicit_json = run_action(DaemonAction::Export(DaemonExportOptions {
+            smoke: DaemonSmokeOptions::default(),
+            format: "json".to_string(),
+        }))
+        .expect("explicit export json");
+
+        let default_value: serde_json::Value =
+            serde_json::from_str(&default_json).expect("parse default json");
+        let explicit_value: serde_json::Value =
+            serde_json::from_str(&explicit_json).expect("parse explicit json");
+        assert_eq!(default_value, explicit_value);
+    }
+
+    #[test]
+    fn export_markdown_includes_all_ledger_sections() {
+        let markdown = run_action(DaemonAction::Export(DaemonExportOptions {
+            smoke: DaemonSmokeOptions::default(),
+            format: "markdown".to_string(),
+        }))
+        .expect("export markdown");
+
+        for heading in [
+            "# Cowork Run Ledger Export",
+            "## Run",
+            "## Objective",
+            "## Tasks",
+            "## Evidence",
+            "## Checkpoints",
+            "## Artifacts",
+            "## Browser",
+            "## Providers",
+            "## Subagents",
+        ] {
+            assert!(markdown.contains(heading), "missing heading {heading}");
+        }
+
+        assert!(markdown.contains("cowork-smoke-objective"));
+        assert!(markdown.contains("cowork-smoke-worker"));
+        assert!(markdown.contains("cowork-smoke-provider"));
+        assert!(markdown.contains("cowork-smoke-browser"));
+    }
+
+    #[test]
+    fn export_restarts_to_same_snapshot() {
+        let request = SmokeDaemonRequest::default();
+        let mut first_controller = SmokeDaemonController::default();
+        first_controller
+            .start(request.clone())
+            .expect("first start");
+        let first = first_controller
+            .connect(request.clone())
+            .expect("first connect")
+            .snapshot;
+
+        let mut second_controller = SmokeDaemonController::default();
+        second_controller
+            .start(request.clone())
+            .expect("second start");
+        let second = second_controller
+            .connect(request)
+            .expect("second connect")
+            .snapshot;
+
+        assert_eq!(first, second);
+        assert_eq!(
+            to_pretty_json(&first).expect("first json"),
+            to_pretty_json(&second).expect("second json")
+        );
+    }
+
+    #[test]
+    fn unsupported_export_format_has_stable_error_code() {
+        let error = run_action(DaemonAction::Export(DaemonExportOptions {
+            smoke: DaemonSmokeOptions::default(),
+            format: "yaml".to_string(),
+        }))
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            CoworkDaemonSmokeError::UnsupportedExportFormat { .. }
+        ));
+        assert_eq!(error.code(), "unsupported_export_format");
+        assert_eq!(
+            error.protocol_error().code(),
+            ProtocolErrorCode::InvalidRequest
+        );
     }
 
     #[test]

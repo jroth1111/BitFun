@@ -166,9 +166,15 @@ run_step "daemon status" \
   cargo run -q -p bitfun-cli -- daemon status
 run_step "daemon export" \
   cargo run -q -p bitfun-cli -- daemon export
+run_step "daemon export json" \
+  cargo run -q -p bitfun-cli -- daemon export --format json
+run_step "daemon export markdown" \
+  cargo run -q -p bitfun-cli -- daemon export --format markdown
 run_negative_smoke "daemon unsupported endpoint" "unsupported_endpoint" "invalid_request" \
   cargo run -q -p bitfun-cli -- daemon start --endpoint unsupported-endpoint
 run_negative_smoke "daemon unsupported target" "unsupported_target" "invalid_request" \
   cargo run -q -p bitfun-cli -- daemon start --target unsupported-target
+run_negative_smoke "daemon unsupported export format" "unsupported_export_format" "invalid_request" \
+  cargo run -q -p bitfun-cli -- daemon export --format yaml
 
 printf "Cowork smoke passed. Log: %s\n" "${LOG_FILE}"
