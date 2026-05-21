@@ -5,12 +5,13 @@
 
 use chrono::Utc;
 use cowork_ledger::{
-    ActorRef, CoworkLedger, EntityRef, Evidence, EvidenceId, EvidenceKind, EvidenceResult,
-    LedgerError, LedgerUpdate, Metadata, ObjectiveProgressUpdate, ObjectiveStatus, StopReasonId,
-    StopReasonKind, StopReasonRecord, Task, TaskId, TaskStatus, TaskStatusUpdate,
+    ActorRef, ArtifactId, BlockerId, CoworkLedger, EntityRef, Evidence, EvidenceId, EvidenceKind,
+    EvidenceResult, LedgerError, LedgerUpdate, Metadata, ObjectiveProgressUpdate, ObjectiveStatus,
+    StopReasonId, StopReasonKind, StopReasonRecord, Task, TaskId, TaskStatus, TaskStatusUpdate,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::fmt;
 use thiserror::Error;
 
 pub const RUNTIME_VERSION: &str = "cowork.runtime.v1";
@@ -25,6 +26,8 @@ pub enum RuntimeStopKind {
     BudgetExceeded,
     Failed,
     ModelMessageWithoutEvidence,
+    SubmitReportRequired,
+    SubmitReportRejected,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,8 +114,161 @@ impl ToolResult {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ObjectiveResponse {
+    ToolResult(ToolResult),
+    SubmitReport(SubmitReport),
+}
+
+impl From<ToolResult> for ObjectiveResponse {
+    fn from(result: ToolResult) -> Self {
+        Self::ToolResult(result)
+    }
+}
+
+impl From<SubmitReport> for ObjectiveResponse {
+    fn from(report: SubmitReport) -> Self {
+        Self::SubmitReport(report)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubmitReportStatus {
+    Verified,
+    Blocked,
+    Failed,
+    Cancelled,
+}
+
+impl SubmitReportStatus {
+    fn task_status(self) -> TaskStatus {
+        match self {
+            Self::Verified => TaskStatus::Verified,
+            Self::Blocked => TaskStatus::Blocked,
+            Self::Failed => TaskStatus::Failed,
+            Self::Cancelled => TaskStatus::Cancelled,
+        }
+    }
+
+    fn evidence_result(self) -> EvidenceResult {
+        match self {
+            Self::Verified => EvidenceResult::Passed,
+            Self::Blocked => EvidenceResult::Blocked,
+            Self::Failed | Self::Cancelled => EvidenceResult::Failed,
+        }
+    }
+
+    fn stop_reason_kind(self) -> StopReasonKind {
+        match self {
+            Self::Verified => StopReasonKind::Verified,
+            Self::Blocked => StopReasonKind::BlockedExternalInput,
+            Self::Failed => StopReasonKind::Failed,
+            Self::Cancelled => StopReasonKind::Cancelled,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubmitReport {
+    pub status: SubmitReportStatus,
+    pub summary: String,
+    #[serde(default)]
+    pub evidence_ids: Vec<EvidenceId>,
+    #[serde(default)]
+    pub artifact_ids: Vec<ArtifactId>,
+    #[serde(default)]
+    pub blocker_ids: Vec<BlockerId>,
+    pub confidence: u8,
+}
+
+impl SubmitReport {
+    pub fn new(
+        status: SubmitReportStatus,
+        summary: impl Into<String>,
+        evidence_ids: Vec<EvidenceId>,
+        artifact_ids: Vec<ArtifactId>,
+        blocker_ids: Vec<BlockerId>,
+        confidence: u8,
+    ) -> Self {
+        Self {
+            status,
+            summary: summary.into(),
+            evidence_ids,
+            artifact_ids,
+            blocker_ids,
+            confidence,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubmitReportRejection {
+    EmptySummary,
+    ConfidenceOutOfRange(u8),
+    VerifiedWithoutEvidence,
+    BlockedWithoutBlocker,
+    DuplicateEvidenceId(EvidenceId),
+    DuplicateArtifactId(ArtifactId),
+    DuplicateBlockerId(BlockerId),
+    UnknownEvidenceId(EvidenceId),
+    UnknownArtifactId(ArtifactId),
+    UnknownBlockerId(BlockerId),
+    VerifiedWithoutPassedEvidence,
+}
+
+impl fmt::Display for SubmitReportRejection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptySummary => formatter.write_str("SubmitReport summary is empty"),
+            Self::ConfidenceOutOfRange(confidence) => {
+                write!(
+                    formatter,
+                    "SubmitReport confidence {confidence} is outside 0..=100"
+                )
+            }
+            Self::VerifiedWithoutEvidence => {
+                formatter.write_str("verified SubmitReport must cite at least one evidence id")
+            }
+            Self::BlockedWithoutBlocker => {
+                formatter.write_str("blocked SubmitReport must cite at least one blocker id")
+            }
+            Self::DuplicateEvidenceId(id) => {
+                write!(
+                    formatter,
+                    "SubmitReport includes duplicate evidence id '{id}'"
+                )
+            }
+            Self::DuplicateArtifactId(id) => {
+                write!(
+                    formatter,
+                    "SubmitReport includes duplicate artifact id '{id}'"
+                )
+            }
+            Self::DuplicateBlockerId(id) => {
+                write!(
+                    formatter,
+                    "SubmitReport includes duplicate blocker id '{id}'"
+                )
+            }
+            Self::UnknownEvidenceId(id) => {
+                write!(formatter, "SubmitReport cites unknown evidence id '{id}'")
+            }
+            Self::UnknownArtifactId(id) => {
+                write!(formatter, "SubmitReport cites unknown artifact id '{id}'")
+            }
+            Self::UnknownBlockerId(id) => {
+                write!(formatter, "SubmitReport cites unknown blocker id '{id}'")
+            }
+            Self::VerifiedWithoutPassedEvidence => formatter
+                .write_str("verified SubmitReport must cite at least one passed evidence record"),
+        }
+    }
+}
+
 pub trait ObjectiveDriver {
-    fn execute(&mut self, request: &ToolRequest, task: &Task) -> ToolResult;
+    fn execute(&mut self, request: &ToolRequest, task: &Task) -> ObjectiveResponse;
 }
 
 #[derive(Debug, Error)]
@@ -235,12 +391,41 @@ where
                 attempt,
                 tool_name: "synthetic-objective-tool".to_string(),
             };
-            let result = self.driver.execute(&request, &task);
+            let response = self.driver.execute(&request, &task);
+            let result = match response {
+                ObjectiveResponse::SubmitReport(report) => {
+                    return match self.accept_submit_report(&task, report)? {
+                        Ok(()) => continue,
+                        Err(rejection) => {
+                            let summary = format!("SubmitReport rejected: {rejection}.");
+                            let stop = self.stop_task(
+                                &task.id,
+                                RuntimeStopKind::SubmitReportRejected,
+                                TaskStatus::Failed,
+                                StopReasonKind::Failed,
+                                &summary,
+                            )?;
+                            Ok(self.finish(stop))
+                        }
+                    };
+                }
+                ObjectiveResponse::ToolResult(result) => result,
+            };
 
             if result.success
                 && result.evidence_result == EvidenceResult::Passed
                 && result.evidence_summary.is_some()
             {
+                if task_requires_submit_report(&task) {
+                    let stop = self.stop_task(
+                        &task.id,
+                        RuntimeStopKind::SubmitReportRequired,
+                        TaskStatus::Failed,
+                        StopReasonKind::Failed,
+                        "Child task requires an accepted SubmitReport before it can close.",
+                    )?;
+                    return Ok(self.finish(stop));
+                }
                 let evidence_id = self.record_tool_evidence(&task.id, attempt, result)?;
                 self.verify_task(&task, evidence_id)?;
                 continue;
@@ -347,6 +532,132 @@ where
                 metadata: runtime_metadata("tool_result"),
             }))?;
         Ok(evidence_id)
+    }
+
+    fn accept_submit_report(
+        &mut self,
+        task: &Task,
+        report: SubmitReport,
+    ) -> Result<Result<(), SubmitReportRejection>, LedgerError> {
+        if let Err(rejection) = self.validate_submit_report(&report) {
+            return Ok(Err(rejection));
+        }
+        let evidence_id = self.record_submit_report_evidence(&task.id, &report)?;
+        self.transition_task_from_submit_report(task, report, evidence_id)?;
+        Ok(Ok(()))
+    }
+
+    fn validate_submit_report(&self, report: &SubmitReport) -> Result<(), SubmitReportRejection> {
+        if report.summary.trim().is_empty() {
+            return Err(SubmitReportRejection::EmptySummary);
+        }
+        if report.confidence > 100 {
+            return Err(SubmitReportRejection::ConfidenceOutOfRange(
+                report.confidence,
+            ));
+        }
+        if report.status == SubmitReportStatus::Verified && report.evidence_ids.is_empty() {
+            return Err(SubmitReportRejection::VerifiedWithoutEvidence);
+        }
+        if report.status == SubmitReportStatus::Blocked && report.blocker_ids.is_empty() {
+            return Err(SubmitReportRejection::BlockedWithoutBlocker);
+        }
+
+        let mut has_passed_evidence = false;
+        for (index, evidence_id) in report.evidence_ids.iter().enumerate() {
+            if report.evidence_ids[..index].contains(evidence_id) {
+                return Err(SubmitReportRejection::DuplicateEvidenceId(
+                    evidence_id.clone(),
+                ));
+            }
+            let Some(evidence) = self.ledger.evidence().get(evidence_id) else {
+                return Err(SubmitReportRejection::UnknownEvidenceId(
+                    evidence_id.clone(),
+                ));
+            };
+            has_passed_evidence |= evidence.result == EvidenceResult::Passed;
+        }
+        if report.status == SubmitReportStatus::Verified && !has_passed_evidence {
+            return Err(SubmitReportRejection::VerifiedWithoutPassedEvidence);
+        }
+
+        for (index, artifact_id) in report.artifact_ids.iter().enumerate() {
+            if report.artifact_ids[..index].contains(artifact_id) {
+                return Err(SubmitReportRejection::DuplicateArtifactId(
+                    artifact_id.clone(),
+                ));
+            }
+            if !self.ledger.artifacts().contains_key(artifact_id) {
+                return Err(SubmitReportRejection::UnknownArtifactId(
+                    artifact_id.clone(),
+                ));
+            }
+        }
+
+        for (index, blocker_id) in report.blocker_ids.iter().enumerate() {
+            if report.blocker_ids[..index].contains(blocker_id) {
+                return Err(SubmitReportRejection::DuplicateBlockerId(
+                    blocker_id.clone(),
+                ));
+            }
+            if !self.ledger.blockers().contains_key(blocker_id) {
+                return Err(SubmitReportRejection::UnknownBlockerId(blocker_id.clone()));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn record_submit_report_evidence(
+        &mut self,
+        task_id: &TaskId,
+        report: &SubmitReport,
+    ) -> Result<EvidenceId, LedgerError> {
+        let evidence_id = EvidenceId::parse(format!("evidence/submit-report-{}", self.turns))?;
+        self.ledger
+            .apply_update(LedgerUpdate::RecordEvidence(Evidence {
+                id: evidence_id.clone(),
+                kind: EvidenceKind::SubagentReport,
+                summary: report.summary.clone(),
+                collected_at: Utc::now(),
+                collected_by: self.actor.clone(),
+                result: report.status.evidence_result(),
+                subjects: vec![EntityRef::Task(task_id.clone())],
+                command: None,
+                source_refs: Vec::new(),
+                artifact_ids: report.artifact_ids.clone(),
+                metadata: submit_report_metadata(report),
+            }))?;
+        Ok(evidence_id)
+    }
+
+    fn transition_task_from_submit_report(
+        &mut self,
+        task: &Task,
+        report: SubmitReport,
+        report_evidence_id: EvidenceId,
+    ) -> Result<(), LedgerError> {
+        let stop_reason_kind = report.status.stop_reason_kind();
+        let stop_reason_id = self.record_task_stop_reason(
+            &task.id,
+            stop_reason_kind,
+            &format!("SubmitReport accepted: {}", report.summary),
+        )?;
+        let mut evidence_ids = report.evidence_ids;
+        push_unique(&mut evidence_ids, report_evidence_id);
+        self.ledger
+            .apply_update(LedgerUpdate::UpdateTaskStatus(TaskStatusUpdate {
+                task_id: task.id.clone(),
+                status: report.status.task_status(),
+                updated_at: Utc::now(),
+                updated_by: self.actor.clone(),
+                evidence_ids,
+                blocker_ids: report.blocker_ids,
+                stop_reason_id: Some(stop_reason_id),
+                verification_waiver_id: None,
+                metadata: runtime_metadata("submit_report_accepted"),
+            }))?;
+        Ok(())
     }
 
     fn verify_task(&mut self, task: &Task, evidence_id: EvidenceId) -> Result<(), LedgerError> {
@@ -497,6 +808,65 @@ pub fn runtime_metadata(event: &str) -> Metadata {
     metadata
 }
 
+fn submit_report_metadata(report: &SubmitReport) -> Metadata {
+    let mut metadata = runtime_metadata("submit_report");
+    metadata.insert(
+        "reportedStatus".to_string(),
+        serde_json::to_value(report.status).expect("SubmitReportStatus serializes"),
+    );
+    metadata.insert(
+        "reportedEvidenceIds".to_string(),
+        serde_json::Value::Array(
+            report
+                .evidence_ids
+                .iter()
+                .map(|id| serde_json::Value::String(id.to_string()))
+                .collect(),
+        ),
+    );
+    metadata.insert(
+        "reportedArtifactIds".to_string(),
+        serde_json::Value::Array(
+            report
+                .artifact_ids
+                .iter()
+                .map(|id| serde_json::Value::String(id.to_string()))
+                .collect(),
+        ),
+    );
+    metadata.insert(
+        "reportedBlockerIds".to_string(),
+        serde_json::Value::Array(
+            report
+                .blocker_ids
+                .iter()
+                .map(|id| serde_json::Value::String(id.to_string()))
+                .collect(),
+        ),
+    );
+    metadata.insert(
+        "confidence".to_string(),
+        serde_json::Value::Number(serde_json::Number::from(report.confidence)),
+    );
+    metadata
+}
+
+fn task_requires_submit_report(task: &Task) -> bool {
+    task.metadata
+        .get("requiresSubmitReport")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn push_unique<T>(values: &mut Vec<T>, value: T)
+where
+    T: PartialEq,
+{
+    if !values.contains(&value) {
+        values.push(value);
+    }
+}
+
 fn kind_slug(kind: StopReasonKind) -> &'static str {
     match kind {
         StopReasonKind::Verified => "verified",
@@ -517,8 +887,8 @@ pub fn run_deterministic_synthetic_loop(
     let runtime = CoworkRuntime::new(
         ledger,
         SequenceDriver::new(vec![
-            ToolResult::failed("initial tool failure"),
-            ToolResult::passed("repair attempt passed acceptance probes"),
+            ToolResult::failed("initial tool failure").into(),
+            ToolResult::passed("repair attempt passed acceptance probes").into(),
         ]),
         RuntimeOptions::default(),
         actor,
@@ -528,23 +898,23 @@ pub fn run_deterministic_synthetic_loop(
 
 #[derive(Debug, Clone)]
 pub struct SequenceDriver {
-    results: Vec<ToolResult>,
+    results: Vec<ObjectiveResponse>,
     index: usize,
 }
 
 impl SequenceDriver {
-    pub fn new(results: Vec<ToolResult>) -> Self {
+    pub fn new(results: Vec<ObjectiveResponse>) -> Self {
         Self { results, index: 0 }
     }
 }
 
 impl ObjectiveDriver for SequenceDriver {
-    fn execute(&mut self, _request: &ToolRequest, _task: &Task) -> ToolResult {
+    fn execute(&mut self, _request: &ToolRequest, _task: &Task) -> ObjectiveResponse {
         let result = self
             .results
             .get(self.index)
             .cloned()
-            .unwrap_or_else(|| ToolResult::failed("scripted driver exhausted"));
+            .unwrap_or_else(|| ToolResult::failed("scripted driver exhausted").into());
         self.index += 1;
         result
     }
@@ -554,8 +924,9 @@ impl ObjectiveDriver for SequenceDriver {
 mod tests {
     use super::*;
     use cowork_ledger::{
-        ActorKind, ConstraintSeverity, ConstraintSource, LedgerInitialization, RootConstraintId,
-        RootConstraintInitialization, RootObjectiveId,
+        ActorKind, Artifact, ArtifactKind, Blocker, BlockerStatus, ConstraintSeverity,
+        ConstraintSource, LedgerInitialization, RootConstraintId, RootConstraintInitialization,
+        RootObjectiveId,
     };
 
     fn actor() -> ActorRef {
@@ -574,7 +945,23 @@ mod tests {
         TaskId::parse("task/runtime-test").expect("task id")
     }
 
+    fn evidence_id() -> EvidenceId {
+        EvidenceId::parse("evidence/subagent-acceptance").expect("evidence id")
+    }
+
+    fn artifact_id() -> ArtifactId {
+        ArtifactId::parse("artifact/subagent-patch").expect("artifact id")
+    }
+
+    fn blocker_id() -> BlockerId {
+        BlockerId::parse("blocker/subagent-input").expect("blocker id")
+    }
+
     fn ledger_with_task(status: TaskStatus) -> CoworkLedger {
+        ledger_with_task_metadata(status, Metadata::new())
+    }
+
+    fn ledger_with_task_metadata(status: TaskStatus, metadata: Metadata) -> CoworkLedger {
         let mut ledger = CoworkLedger::initialize(LedgerInitialization {
             root_objective_id: objective_id(),
             root_objective_text: "Prove the autonomous objective loop.".to_string(),
@@ -605,13 +992,62 @@ mod tests {
                 evidence_ids: Vec::new(),
                 artifact_ids: Vec::new(),
                 checkpoint_ids: Vec::new(),
-                metadata: Metadata::new(),
+                metadata,
             }))
             .expect("register task");
         ledger
     }
 
-    fn run_with(results: Vec<ToolResult>) -> (CoworkLedger, SyntheticRunReport) {
+    fn record_passed_evidence(ledger: &mut CoworkLedger) {
+        ledger
+            .apply_update(LedgerUpdate::RecordEvidence(Evidence {
+                id: evidence_id(),
+                kind: EvidenceKind::Test,
+                summary: "Subagent acceptance probes passed.".to_string(),
+                collected_at: Utc::now(),
+                collected_by: actor(),
+                result: EvidenceResult::Passed,
+                subjects: vec![EntityRef::Task(task_id())],
+                command: None,
+                source_refs: Vec::new(),
+                artifact_ids: Vec::new(),
+                metadata: Metadata::new(),
+            }))
+            .expect("record passed evidence");
+    }
+
+    fn record_artifact(ledger: &mut CoworkLedger) {
+        ledger
+            .apply_update(LedgerUpdate::RecordArtifact(Artifact {
+                id: artifact_id(),
+                kind: ArtifactKind::Diff,
+                title: "Subagent patch artifact".to_string(),
+                uri: Some("artifacts/subagent.patch".to_string()),
+                content_hash: None,
+                produced_by: EntityRef::Task(task_id()),
+                evidence_ids: Vec::new(),
+                metadata: Metadata::new(),
+            }))
+            .expect("record artifact");
+    }
+
+    fn record_blocker(ledger: &mut CoworkLedger) {
+        ledger
+            .apply_update(LedgerUpdate::RecordBlocker(Blocker {
+                id: blocker_id(),
+                summary: "Subagent requires external input.".to_string(),
+                status: BlockerStatus::Open,
+                opened_at: Utc::now(),
+                resolved_at: None,
+                task_ids: vec![task_id()],
+                required_external_input: vec!["missing fixture".to_string()],
+                evidence_ids: Vec::new(),
+                metadata: Metadata::new(),
+            }))
+            .expect("record blocker");
+    }
+
+    fn run_with(results: Vec<ObjectiveResponse>) -> (CoworkLedger, SyntheticRunReport) {
         CoworkRuntime::new(
             ledger_with_task(TaskStatus::NotStarted),
             SequenceDriver::new(results),
@@ -624,7 +1060,7 @@ mod tests {
 
     #[test]
     fn selects_next_task_records_tool_evidence_and_verifies_with_typed_stop() {
-        let (ledger, report) = run_with(vec![ToolResult::passed("tool call passed")]);
+        let (ledger, report) = run_with(vec![ToolResult::passed("tool call passed").into()]);
 
         assert_eq!(
             report.selected_task_id.as_deref(),
@@ -663,7 +1099,7 @@ mod tests {
     fn max_turn_guard_returns_typed_objective_stop() {
         let runtime = CoworkRuntime::new(
             ledger_with_task(TaskStatus::NotStarted),
-            SequenceDriver::new(vec![ToolResult::failed("keeps failing")]),
+            SequenceDriver::new(vec![ToolResult::failed("keeps failing").into()]),
             RuntimeOptions {
                 max_turns: 1,
                 budget_limit: 10,
@@ -686,7 +1122,7 @@ mod tests {
     fn budget_guard_returns_typed_objective_stop() {
         let runtime = CoworkRuntime::new(
             ledger_with_task(TaskStatus::NotStarted),
-            SequenceDriver::new(vec![ToolResult::failed("keeps failing")]),
+            SequenceDriver::new(vec![ToolResult::failed("keeps failing").into()]),
             RuntimeOptions {
                 max_turns: 10,
                 budget_limit: 1,
@@ -705,7 +1141,7 @@ mod tests {
     fn cancellation_updates_task_with_cancelled_stop_reason() {
         let mut runtime = CoworkRuntime::new(
             ledger_with_task(TaskStatus::NotStarted),
-            SequenceDriver::new(vec![ToolResult::passed("should not run")]),
+            SequenceDriver::new(vec![ToolResult::passed("should not run").into()]),
             RuntimeOptions::default(),
             actor(),
         );
@@ -727,7 +1163,7 @@ mod tests {
 
     #[test]
     fn model_message_without_evidence_cannot_close_task() {
-        let (ledger, report) = run_with(vec![ToolResult::model_message("done")]);
+        let (ledger, report) = run_with(vec![ToolResult::model_message("done").into()]);
 
         assert_eq!(
             report.stop.kind,
@@ -738,6 +1174,165 @@ mod tests {
         assert_ne!(
             ledger.tasks().get(&task_id()).unwrap().status,
             TaskStatus::Verified
+        );
+    }
+
+    #[test]
+    fn child_task_cannot_complete_without_accepted_submit_report() {
+        let mut metadata = Metadata::new();
+        metadata.insert(
+            "requiresSubmitReport".to_string(),
+            serde_json::Value::Bool(true),
+        );
+        let runtime = CoworkRuntime::new(
+            ledger_with_task_metadata(TaskStatus::NotStarted, metadata),
+            SequenceDriver::new(vec![ToolResult::passed("ordinary tool evidence").into()]),
+            RuntimeOptions::default(),
+            actor(),
+        );
+        let (ledger, report) = runtime.run().expect("runtime run");
+
+        assert_eq!(report.stop.kind, RuntimeStopKind::SubmitReportRequired);
+        assert_eq!(report.evidence_records, 0);
+        assert_eq!(report.final_task_status, Some(TaskStatus::Failed));
+        assert_ne!(
+            ledger.tasks().get(&task_id()).unwrap().status,
+            TaskStatus::Verified
+        );
+    }
+
+    #[test]
+    fn submit_report_verifies_child_task_with_report_evidence() {
+        let mut ledger = ledger_with_task(TaskStatus::NotStarted);
+        record_passed_evidence(&mut ledger);
+        record_artifact(&mut ledger);
+
+        let report_result = SubmitReport::new(
+            SubmitReportStatus::Verified,
+            "Subagent completed acceptance probes.",
+            vec![evidence_id()],
+            vec![artifact_id()],
+            Vec::new(),
+            91,
+        );
+        let (ledger, report) = CoworkRuntime::new(
+            ledger,
+            SequenceDriver::new(vec![report_result.into()]),
+            RuntimeOptions::default(),
+            actor(),
+        )
+        .run()
+        .expect("runtime run");
+
+        assert_eq!(report.stop.kind, RuntimeStopKind::Verified);
+        assert_eq!(report.tool_calls, 1);
+        assert_eq!(report.final_task_status, Some(TaskStatus::Verified));
+        let task = ledger.tasks().get(&task_id()).unwrap();
+        assert_eq!(task.status, TaskStatus::Verified);
+        assert!(task
+            .evidence_ids
+            .contains(&EvidenceId::parse("evidence/submit-report-1").unwrap()));
+        let report_evidence = ledger
+            .evidence()
+            .get(&EvidenceId::parse("evidence/submit-report-1").unwrap())
+            .expect("report evidence");
+        assert_eq!(report_evidence.kind, EvidenceKind::SubagentReport);
+        assert_eq!(report_evidence.result, EvidenceResult::Passed);
+        assert_eq!(report_evidence.artifact_ids, vec![artifact_id()]);
+        assert_eq!(
+            report_evidence.metadata.get("reportedEvidenceIds"),
+            Some(&serde_json::json!(["evidence/subagent-acceptance"]))
+        );
+        assert_eq!(
+            report_evidence.metadata.get("reportedArtifactIds"),
+            Some(&serde_json::json!(["artifact/subagent-patch"]))
+        );
+        assert_eq!(
+            report_evidence.metadata.get("confidence"),
+            Some(&serde_json::json!(91))
+        );
+    }
+
+    #[test]
+    fn empty_submit_report_is_rejected_without_closing_complete() {
+        let report_result = SubmitReport::new(
+            SubmitReportStatus::Failed,
+            "  ",
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            42,
+        );
+        let (ledger, report) = run_with(vec![report_result.into()]);
+
+        assert_eq!(report.stop.kind, RuntimeStopKind::SubmitReportRejected);
+        assert_eq!(report.evidence_records, 0);
+        assert_eq!(report.final_task_status, Some(TaskStatus::Failed));
+        assert_ne!(
+            ledger.tasks().get(&task_id()).unwrap().status,
+            TaskStatus::Verified
+        );
+        assert!(ledger
+            .evidence()
+            .values()
+            .all(|evidence| evidence.kind != EvidenceKind::SubagentReport));
+    }
+
+    #[test]
+    fn verified_submit_report_requires_known_passed_evidence() {
+        let report_result = SubmitReport::new(
+            SubmitReportStatus::Verified,
+            "Subagent claims completion without accepted evidence.",
+            vec![EvidenceId::parse("evidence/missing").unwrap()],
+            Vec::new(),
+            Vec::new(),
+            88,
+        );
+        let (ledger, report) = run_with(vec![report_result.into()]);
+
+        assert_eq!(report.stop.kind, RuntimeStopKind::SubmitReportRejected);
+        assert_eq!(report.final_task_status, Some(TaskStatus::Failed));
+        assert_ne!(
+            ledger.tasks().get(&task_id()).unwrap().status,
+            TaskStatus::Verified
+        );
+    }
+
+    #[test]
+    fn blocked_submit_report_carries_blockers() {
+        let mut ledger = ledger_with_task(TaskStatus::NotStarted);
+        record_blocker(&mut ledger);
+        let report_result = SubmitReport::new(
+            SubmitReportStatus::Blocked,
+            "Subagent is blocked on missing fixture input.",
+            Vec::new(),
+            Vec::new(),
+            vec![blocker_id()],
+            76,
+        );
+        let (ledger, report) = CoworkRuntime::new(
+            ledger,
+            SequenceDriver::new(vec![report_result.into()]),
+            RuntimeOptions::default(),
+            actor(),
+        )
+        .run()
+        .expect("runtime run");
+
+        assert_eq!(report.stop.kind, RuntimeStopKind::NoReadyTask);
+        assert_eq!(report.final_task_status, Some(TaskStatus::Blocked));
+        let task = ledger.tasks().get(&task_id()).unwrap();
+        assert_eq!(task.status, TaskStatus::Blocked);
+        assert_eq!(task.blocker_ids, vec![blocker_id()]);
+        let report_evidence = ledger
+            .evidence()
+            .get(&EvidenceId::parse("evidence/submit-report-1").unwrap())
+            .expect("report evidence");
+        assert_eq!(report_evidence.kind, EvidenceKind::SubagentReport);
+        assert_eq!(report_evidence.result, EvidenceResult::Blocked);
+        assert_eq!(
+            report_evidence.metadata.get("reportedBlockerIds"),
+            Some(&serde_json::json!(["blocker/subagent-input"]))
         );
     }
 }
