@@ -26,7 +26,7 @@ use thiserror::Error;
 pub const PROTOCOL_NAME: &str = "cowork.daemon";
 pub const JSON_RPC_VERSION: &str = "2.0";
 pub const PROTOCOL_VERSION_MAJOR: u16 = 1;
-pub const PROTOCOL_VERSION_MINOR: u16 = 2;
+pub const PROTOCOL_VERSION_MINOR: u16 = 3;
 pub const PROTOCOL_VERSION_PATCH: u16 = 0;
 
 pub type Metadata = BTreeMap<String, serde_json::Value>;
@@ -268,6 +268,10 @@ pub struct CoworkSnapshot {
     #[serde(default)]
     pub subagents: Vec<Subagent>,
     #[serde(default)]
+    pub event_log: CoworkEventLog,
+    #[serde(default)]
+    pub worker_inbox: WorkerInbox,
+    #[serde(default)]
     pub providers: Vec<Provider>,
     pub browser: BrowserState,
     pub run_status: RunStatus,
@@ -328,6 +332,187 @@ pub struct HistoryRetrievalResult {
     pub providers: Vec<Provider>,
     pub browser: Option<BrowserState>,
     pub result_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CoworkEventPollRequest {
+    #[serde(default)]
+    pub after_sequence: u64,
+    #[serde(default = "default_event_poll_limit")]
+    pub limit: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subagent_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<CoworkEventKind>,
+    #[serde(default)]
+    pub include_inbox: bool,
+}
+
+impl CoworkEventPollRequest {
+    pub fn normalize_limit(&self) -> usize {
+        self.limit.clamp(1, 250)
+    }
+}
+
+fn default_event_poll_limit() -> usize {
+    50
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CoworkEventPollResult {
+    pub request: CoworkEventPollRequest,
+    #[serde(default)]
+    pub events: Vec<CoworkEvent>,
+    #[serde(default)]
+    pub inbox_messages: Vec<WorkerInboxMessage>,
+    pub next_sequence: u64,
+    pub has_more: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CoworkEventLog {
+    #[serde(default)]
+    pub events: Vec<CoworkEvent>,
+}
+
+impl CoworkEventLog {
+    pub fn poll(&self, request: &CoworkEventPollRequest) -> (Vec<CoworkEvent>, bool, u64) {
+        let limit = request.normalize_limit();
+        let mut matching = self
+            .events
+            .iter()
+            .filter(|event| event.sequence > request.after_sequence)
+            .filter(|event| {
+                request.subagent_id.as_ref().map_or(true, |subagent_id| {
+                    event.subagent_id.as_ref() == Some(subagent_id)
+                })
+            })
+            .filter(|event| request.kind.map_or(true, |kind| event.kind == kind));
+
+        let events = matching.by_ref().take(limit).cloned().collect::<Vec<_>>();
+        let has_more = matching.next().is_some();
+        let next_sequence = events
+            .last()
+            .map(|event| event.sequence)
+            .unwrap_or(request.after_sequence);
+
+        (events, has_more, next_sequence)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CoworkEvent {
+    pub id: String,
+    pub sequence: u64,
+    pub kind: CoworkEventKind,
+    pub summary: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub objective_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subagent_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inbox_message_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval_request_id: Option<String>,
+    #[serde(default)]
+    pub evidence_ids: Vec<String>,
+    #[serde(default)]
+    pub artifact_ids: Vec<String>,
+    #[serde(default)]
+    pub blocker_ids: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: Metadata,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CoworkEventKind {
+    ParentTaskStarted,
+    ChildTaskScheduled,
+    ChildProgress,
+    ReportSubmitted,
+    ApprovalRequested,
+    InboxMessageQueued,
+    WorkerStateChanged,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerInbox {
+    #[serde(default)]
+    pub messages: Vec<WorkerInboxMessage>,
+}
+
+impl WorkerInbox {
+    pub fn poll(&self, request: &CoworkEventPollRequest) -> Vec<WorkerInboxMessage> {
+        if !request.include_inbox {
+            return Vec::new();
+        }
+
+        self.messages
+            .iter()
+            .filter(|message| message.sequence > request.after_sequence)
+            .filter(|message| {
+                request
+                    .subagent_id
+                    .as_ref()
+                    .map_or(true, |subagent_id| &message.to_subagent_id == subagent_id)
+            })
+            .take(request.normalize_limit())
+            .cloned()
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerInboxMessage {
+    pub id: String,
+    pub sequence: u64,
+    pub kind: WorkerInboxMessageKind,
+    pub status: WorkerInboxMessageStatus,
+    pub to_subagent_id: String,
+    pub from_actor_id: String,
+    pub subject: String,
+    pub body: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub evidence_ids: Vec<String>,
+    #[serde(default)]
+    pub artifact_ids: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: Metadata,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerInboxMessageKind {
+    Instruction,
+    ApprovalRequest,
+    ReportRequest,
+    Cancellation,
+    Status,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerInboxMessageStatus {
+    Queued,
+    Delivered,
+    Acknowledged,
+    Superseded,
+    Cancelled,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -904,6 +1089,8 @@ mod tests {
         assert_eq!(snapshot.checkpoints.len(), 1);
         assert_eq!(snapshot.artifacts.len(), 1);
         assert_eq!(snapshot.subagents.len(), 1);
+        assert_eq!(snapshot.event_log.events.len(), 4);
+        assert_eq!(snapshot.worker_inbox.messages.len(), 1);
         assert_eq!(snapshot.providers.len(), 1);
         assert_eq!(snapshot.browser.sessions.len(), 1);
         assert_eq!(snapshot.run_status, RunStatus::Running);
@@ -940,6 +1127,37 @@ mod tests {
         assert_eq!(decoded.message, ProtocolMessage::Response { result });
         assert!(json.contains("\"target\":\"task\""));
         assert!(json.contains("\"includeLinked\":true"));
+    }
+
+    #[test]
+    fn event_poll_result_preserves_reconnect_cursor_and_inbox_messages() {
+        let snapshot = fixture_snapshot();
+        let request = CoworkEventPollRequest {
+            after_sequence: 1,
+            limit: 2,
+            subagent_id: Some("subagent-1".to_string()),
+            kind: None,
+            include_inbox: true,
+        };
+        let (events, has_more, next_sequence) = snapshot.event_log.poll(&request);
+        let inbox_messages = snapshot.worker_inbox.poll(&request);
+        let result = CoworkEventPollResult {
+            request: request.clone(),
+            events,
+            inbox_messages,
+            next_sequence,
+            has_more,
+        };
+
+        let envelope = ProtocolEnvelope::response("events-1", result.clone());
+        let json = serde_json::to_string(&envelope).expect("serialize events envelope");
+        let decoded: ProtocolEnvelope<CoworkEventPollResult> =
+            serde_json::from_str(&json).expect("deserialize events envelope");
+
+        assert_eq!(decoded.message, ProtocolMessage::Response { result });
+        assert_eq!(request.normalize_limit(), 2);
+        assert!(json.contains("\"kind\":\"child_progress\""));
+        assert!(json.contains("\"inboxMessages\""));
     }
 
     fn fixture_snapshot() -> CoworkSnapshot {
@@ -1019,6 +1237,91 @@ mod tests {
                 denied_tools: Vec::new(),
                 metadata: Metadata::new(),
             }],
+            event_log: CoworkEventLog {
+                events: vec![
+                    CoworkEvent {
+                        id: "event-1".to_string(),
+                        sequence: 1,
+                        kind: CoworkEventKind::ParentTaskStarted,
+                        summary: "Parent task started.".to_string(),
+                        objective_id: Some("objective-1".to_string()),
+                        task_id: Some(task_id.clone()),
+                        subagent_id: None,
+                        inbox_message_id: None,
+                        approval_request_id: None,
+                        evidence_ids: Vec::new(),
+                        artifact_ids: Vec::new(),
+                        blocker_ids: Vec::new(),
+                        created_at: Some("2026-05-21T00:00:10Z".to_string()),
+                        metadata: Metadata::new(),
+                    },
+                    CoworkEvent {
+                        id: "event-2".to_string(),
+                        sequence: 2,
+                        kind: CoworkEventKind::ChildTaskScheduled,
+                        summary: "Research subagent scheduled.".to_string(),
+                        objective_id: Some("objective-1".to_string()),
+                        task_id: Some(task_id.clone()),
+                        subagent_id: Some("subagent-1".to_string()),
+                        inbox_message_id: Some("inbox-1".to_string()),
+                        approval_request_id: None,
+                        evidence_ids: Vec::new(),
+                        artifact_ids: Vec::new(),
+                        blocker_ids: Vec::new(),
+                        created_at: Some("2026-05-21T00:00:20Z".to_string()),
+                        metadata: Metadata::new(),
+                    },
+                    CoworkEvent {
+                        id: "event-3".to_string(),
+                        sequence: 3,
+                        kind: CoworkEventKind::ChildProgress,
+                        summary: "Research subagent collected evidence.".to_string(),
+                        objective_id: Some("objective-1".to_string()),
+                        task_id: Some(task_id.clone()),
+                        subagent_id: Some("subagent-1".to_string()),
+                        inbox_message_id: None,
+                        approval_request_id: None,
+                        evidence_ids: vec!["evidence-1".to_string()],
+                        artifact_ids: Vec::new(),
+                        blocker_ids: Vec::new(),
+                        created_at: Some("2026-05-21T00:01:30Z".to_string()),
+                        metadata: Metadata::new(),
+                    },
+                    CoworkEvent {
+                        id: "event-4".to_string(),
+                        sequence: 4,
+                        kind: CoworkEventKind::ReportSubmitted,
+                        summary: "Research subagent submitted a report.".to_string(),
+                        objective_id: Some("objective-1".to_string()),
+                        task_id: Some(task_id.clone()),
+                        subagent_id: Some("subagent-1".to_string()),
+                        inbox_message_id: None,
+                        approval_request_id: None,
+                        evidence_ids: vec!["evidence-1".to_string()],
+                        artifact_ids: vec!["artifact-1".to_string()],
+                        blocker_ids: Vec::new(),
+                        created_at: Some("2026-05-21T00:02:30Z".to_string()),
+                        metadata: Metadata::new(),
+                    },
+                ],
+            },
+            worker_inbox: WorkerInbox {
+                messages: vec![WorkerInboxMessage {
+                    id: "inbox-1".to_string(),
+                    sequence: 2,
+                    kind: WorkerInboxMessageKind::Instruction,
+                    status: WorkerInboxMessageStatus::Queued,
+                    to_subagent_id: "subagent-1".to_string(),
+                    from_actor_id: "daemon".to_string(),
+                    subject: "Collect evidence".to_string(),
+                    body: "Collect source-backed evidence and submit a report.".to_string(),
+                    task_id: Some(task_id.clone()),
+                    evidence_ids: Vec::new(),
+                    artifact_ids: Vec::new(),
+                    created_at: Some("2026-05-21T00:00:20Z".to_string()),
+                    metadata: Metadata::new(),
+                }],
+            },
             providers: vec![Provider {
                 id: "provider-1".to_string(),
                 kind: ProviderKind::OpenAiCompatible,

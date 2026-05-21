@@ -1,12 +1,14 @@
 use clap::{Args, Subcommand};
 use cowork_protocol::{
     Artifact, ArtifactKind, ArtifactProvenance, AuthorityInvariant, BrowserAdapter, BrowserSession,
-    BrowserState, BrowserStatus, BrowserTab, Checkpoint, CoworkSnapshot, Evidence, EvidenceKind,
-    HistoryRetrievalRequest, HistoryRetrievalResult, HistoryRetrievalTarget, HistorySequenceRange,
-    Metadata, Objective, ObjectiveStatus, ProtocolEnvelope, ProtocolError, ProtocolErrorCode,
-    ProtocolVersion, Provider, ProviderCapability, ProviderKind, ProviderStatus, RunStatus,
-    Subagent, SubagentBudget, SubagentDefinition, SubagentLifecycleState, SubagentRegistry,
-    SubagentStatus, SubagentWorkspace, Task, TaskStatus,
+    BrowserState, BrowserStatus, BrowserTab, Checkpoint, CoworkEvent, CoworkEventKind,
+    CoworkEventLog, CoworkEventPollRequest, CoworkEventPollResult, CoworkSnapshot, Evidence,
+    EvidenceKind, HistoryRetrievalRequest, HistoryRetrievalResult, HistoryRetrievalTarget,
+    HistorySequenceRange, Metadata, Objective, ObjectiveStatus, ProtocolEnvelope, ProtocolError,
+    ProtocolErrorCode, ProtocolVersion, Provider, ProviderCapability, ProviderKind, ProviderStatus,
+    RunStatus, Subagent, SubagentBudget, SubagentDefinition, SubagentLifecycleState,
+    SubagentRegistry, SubagentStatus, SubagentWorkspace, Task, TaskStatus, WorkerInbox,
+    WorkerInboxMessage, WorkerInboxMessageKind, WorkerInboxMessageStatus,
 };
 use serde::Serialize;
 use std::error::Error;
@@ -16,6 +18,7 @@ const SUPPORTED_ENDPOINT: &str = "in-process";
 const SUPPORTED_TARGET: &str = "local-smoke";
 const START_RESPONSE_ID: &str = "cowork-daemon-start";
 const RETRIEVE_RESPONSE_ID: &str = "cowork-daemon-retrieve";
+const EVENTS_RESPONSE_ID: &str = "cowork-daemon-events";
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum DaemonAction {
@@ -27,6 +30,8 @@ pub enum DaemonAction {
     Export(DaemonExportOptions),
     /// Retrieve exact historical Cowork records from the deterministic smoke daemon
     Retrieve(DaemonRetrieveOptions),
+    /// Poll durable subagent events and worker inbox messages from the smoke daemon
+    Events(DaemonEventsOptions),
 }
 
 #[derive(Debug, Clone, Args, PartialEq, Eq)]
@@ -94,6 +99,45 @@ pub struct DaemonRetrieveOptions {
     pub sequence_end: Option<u64>,
 }
 
+#[derive(Debug, Clone, Args, PartialEq, Eq)]
+pub struct DaemonEventsOptions {
+    #[command(flatten)]
+    pub smoke: DaemonSmokeOptions,
+
+    /// Return events strictly after this sequence cursor.
+    #[arg(long, default_value_t = 0)]
+    pub after_sequence: u64,
+
+    /// Maximum events to return. Values are clamped to 1..=250.
+    #[arg(long, default_value_t = 50)]
+    pub limit: usize,
+
+    /// Restrict events and inbox messages to one subagent ID.
+    #[arg(long)]
+    pub subagent_id: Option<String>,
+
+    /// Restrict events by kind.
+    #[arg(long)]
+    pub kind: Option<String>,
+
+    /// Include worker inbox messages in the response.
+    #[arg(long, default_value_t = false)]
+    pub include_inbox: bool,
+}
+
+impl Default for DaemonEventsOptions {
+    fn default() -> Self {
+        Self {
+            smoke: DaemonSmokeOptions::default(),
+            after_sequence: 0,
+            limit: 50,
+            subagent_id: None,
+            kind: None,
+            include_inbox: false,
+        }
+    }
+}
+
 impl Default for DaemonRetrieveOptions {
     fn default() -> Self {
         Self {
@@ -138,6 +182,7 @@ pub fn run_action(action: DaemonAction) -> Result<String, CoworkDaemonSmokeError
         DaemonAction::Status(options) => to_pretty_json(&status_output(options)?),
         DaemonAction::Export(options) => export_output(options),
         DaemonAction::Retrieve(options) => retrieve_output(options),
+        DaemonAction::Events(options) => events_output(options),
     }
 }
 
@@ -204,6 +249,22 @@ fn retrieve_output(options: DaemonRetrieveOptions) -> Result<String, CoworkDaemo
     to_pretty_json(&ProtocolEnvelope::response(RETRIEVE_RESPONSE_ID, result))
 }
 
+fn events_output(options: DaemonEventsOptions) -> Result<String, CoworkDaemonSmokeError> {
+    let request = options.into_request()?;
+    let snapshot = export_snapshot(options.smoke)?;
+    let (events, has_more, next_sequence) = snapshot.event_log.poll(&request);
+    let inbox_messages = snapshot.worker_inbox.poll(&request);
+    let result = CoworkEventPollResult {
+        request,
+        events,
+        inbox_messages,
+        next_sequence,
+        has_more,
+    };
+
+    to_pretty_json(&ProtocolEnvelope::response(EVENTS_RESPONSE_ID, result))
+}
+
 impl DaemonRetrieveOptions {
     fn into_request(&self) -> Result<HistoryRetrievalRequest, CoworkDaemonSmokeError> {
         let sequence_range = match (self.sequence_start, self.sequence_end) {
@@ -225,6 +286,33 @@ impl DaemonRetrieveOptions {
             sequence_range,
             include_linked: true,
         })
+    }
+}
+
+impl DaemonEventsOptions {
+    fn into_request(&self) -> Result<CoworkEventPollRequest, CoworkDaemonSmokeError> {
+        Ok(CoworkEventPollRequest {
+            after_sequence: self.after_sequence,
+            limit: self.limit,
+            subagent_id: normalize_optional_text(self.subagent_id.as_deref())?,
+            kind: self.kind.as_deref().map(parse_event_kind).transpose()?,
+            include_inbox: self.include_inbox,
+        })
+    }
+}
+
+fn parse_event_kind(input: &str) -> Result<CoworkEventKind, CoworkDaemonSmokeError> {
+    match input {
+        "parent_task_started" | "parent-task-started" => Ok(CoworkEventKind::ParentTaskStarted),
+        "child_task_scheduled" | "child-task-scheduled" => Ok(CoworkEventKind::ChildTaskScheduled),
+        "child_progress" | "child-progress" => Ok(CoworkEventKind::ChildProgress),
+        "report_submitted" | "report-submitted" => Ok(CoworkEventKind::ReportSubmitted),
+        "approval_requested" | "approval-requested" => Ok(CoworkEventKind::ApprovalRequested),
+        "inbox_message_queued" | "inbox-message-queued" => Ok(CoworkEventKind::InboxMessageQueued),
+        "worker_state_changed" | "worker-state-changed" => Ok(CoworkEventKind::WorkerStateChanged),
+        kind => Err(CoworkDaemonSmokeError::UnsupportedEventKind {
+            kind: kind.to_string(),
+        }),
     }
 }
 
@@ -253,6 +341,19 @@ fn normalize_query(input: Option<&str>) -> Result<Option<String>, CoworkDaemonSm
                 Err(CoworkDaemonSmokeError::EmptyHistoryQuery)
             } else {
                 Ok(query.to_ascii_lowercase())
+            }
+        })
+        .transpose()
+}
+
+fn normalize_optional_text(input: Option<&str>) -> Result<Option<String>, CoworkDaemonSmokeError> {
+    input
+        .map(str::trim)
+        .map(|value| {
+            if value.is_empty() {
+                Err(CoworkDaemonSmokeError::EmptyHistoryQuery)
+            } else {
+                Ok(value.to_string())
             }
         })
         .transpose()
@@ -714,6 +815,8 @@ fn render_snapshot_markdown(snapshot: &CoworkSnapshot) -> String {
     render_evidence(&mut markdown, &snapshot.evidence);
     render_checkpoints(&mut markdown, &snapshot.checkpoints);
     render_artifacts(&mut markdown, &snapshot.artifacts);
+    render_events(&mut markdown, &snapshot.event_log.events);
+    render_worker_inbox(&mut markdown, &snapshot.worker_inbox.messages);
     render_browser(&mut markdown, &snapshot.browser);
     render_providers(&mut markdown, &snapshot.providers);
     render_subagents(&mut markdown, &snapshot.subagents);
@@ -806,6 +909,51 @@ fn render_artifacts(markdown: &mut String, artifacts: &[Artifact]) {
             escape_cell(&artifact.title),
             escape_cell(artifact.uri.as_deref().unwrap_or("none")),
             escape_cell(join_or_none(&artifact.evidence_ids))
+        ));
+    }
+    markdown.push('\n');
+}
+
+fn render_events(markdown: &mut String, events: &[CoworkEvent]) {
+    markdown.push_str("## Events\n\n");
+    if events.is_empty() {
+        markdown.push_str("_No events recorded._\n\n");
+        return;
+    }
+
+    markdown.push_str("| Sequence | ID | Kind | Subagent | Summary |\n");
+    markdown.push_str("| --- | --- | --- | --- | --- |\n");
+    for event in events {
+        markdown.push_str(&format!(
+            "| {} | {} | {} | {} | {} |\n",
+            event.sequence,
+            escape_cell(&event.id),
+            escape_cell(json_label(&event.kind)),
+            escape_cell(event.subagent_id.as_deref().unwrap_or("none")),
+            escape_cell(&event.summary)
+        ));
+    }
+    markdown.push('\n');
+}
+
+fn render_worker_inbox(markdown: &mut String, messages: &[WorkerInboxMessage]) {
+    markdown.push_str("## Worker Inbox\n\n");
+    if messages.is_empty() {
+        markdown.push_str("_No worker inbox messages recorded._\n\n");
+        return;
+    }
+
+    markdown.push_str("| Sequence | ID | Kind | Status | To | Subject |\n");
+    markdown.push_str("| --- | --- | --- | --- | --- | --- |\n");
+    for message in messages {
+        markdown.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} |\n",
+            message.sequence,
+            escape_cell(&message.id),
+            escape_cell(json_label(&message.kind)),
+            escape_cell(json_label(&message.status)),
+            escape_cell(&message.to_subagent_id),
+            escape_cell(&message.subject)
         ));
     }
     markdown.push('\n');
@@ -1144,7 +1292,7 @@ impl LocalSmokeDaemon {
                 uri: None,
                 evidence_ids: vec![evidence_id.clone()],
                 provenance: ArtifactProvenance {
-                    objective_id,
+                    objective_id: objective_id.clone(),
                     task_id: Some(task_id.clone()),
                     evidence_id: Some("cowork-smoke-evidence".to_string()),
                 },
@@ -1183,6 +1331,93 @@ impl LocalSmokeDaemon {
                 denied_tools: Vec::new(),
                 metadata: self.metadata(),
             }],
+            event_log: CoworkEventLog {
+                events: vec![
+                    CoworkEvent {
+                        id: "cowork-smoke-event-1".to_string(),
+                        sequence: 1,
+                        kind: CoworkEventKind::ParentTaskStarted,
+                        summary: "Daemon accepted the parent smoke task.".to_string(),
+                        objective_id: Some(objective_id.clone()),
+                        task_id: Some(task_id.clone()),
+                        subagent_id: None,
+                        inbox_message_id: None,
+                        approval_request_id: None,
+                        evidence_ids: Vec::new(),
+                        artifact_ids: Vec::new(),
+                        blocker_ids: Vec::new(),
+                        created_at: Some("2026-05-21T00:00:10Z".to_string()),
+                        metadata: self.metadata(),
+                    },
+                    CoworkEvent {
+                        id: "cowork-smoke-event-2".to_string(),
+                        sequence: 2,
+                        kind: CoworkEventKind::InboxMessageQueued,
+                        summary: "Daemon queued worker inbox instruction.".to_string(),
+                        objective_id: Some(objective_id.clone()),
+                        task_id: Some(task_id.clone()),
+                        subagent_id: Some(subagent_id.clone()),
+                        inbox_message_id: Some("cowork-smoke-inbox-1".to_string()),
+                        approval_request_id: None,
+                        evidence_ids: Vec::new(),
+                        artifact_ids: Vec::new(),
+                        blocker_ids: Vec::new(),
+                        created_at: Some("2026-05-21T00:00:20Z".to_string()),
+                        metadata: self.metadata(),
+                    },
+                    CoworkEvent {
+                        id: "cowork-smoke-event-3".to_string(),
+                        sequence: 3,
+                        kind: CoworkEventKind::ChildProgress,
+                        summary: "Smoke worker reported daemon boundary progress.".to_string(),
+                        objective_id: Some(objective_id.clone()),
+                        task_id: Some(task_id.clone()),
+                        subagent_id: Some(subagent_id.clone()),
+                        inbox_message_id: None,
+                        approval_request_id: None,
+                        evidence_ids: vec![evidence_id.clone()],
+                        artifact_ids: Vec::new(),
+                        blocker_ids: Vec::new(),
+                        created_at: Some("2026-05-21T00:01:20Z".to_string()),
+                        metadata: self.metadata(),
+                    },
+                    CoworkEvent {
+                        id: "cowork-smoke-event-4".to_string(),
+                        sequence: 4,
+                        kind: CoworkEventKind::ReportSubmitted,
+                        summary: "Smoke worker submitted durable report evidence.".to_string(),
+                        objective_id: Some(objective_id.clone()),
+                        task_id: Some(task_id.clone()),
+                        subagent_id: Some(subagent_id.clone()),
+                        inbox_message_id: None,
+                        approval_request_id: None,
+                        evidence_ids: vec![evidence_id.clone()],
+                        artifact_ids: vec!["cowork-smoke-snapshot".to_string()],
+                        blocker_ids: Vec::new(),
+                        created_at: Some("2026-05-21T00:02:20Z".to_string()),
+                        metadata: self.metadata(),
+                    },
+                ],
+            },
+            worker_inbox: WorkerInbox {
+                messages: vec![WorkerInboxMessage {
+                    id: "cowork-smoke-inbox-1".to_string(),
+                    sequence: 2,
+                    kind: WorkerInboxMessageKind::Instruction,
+                    status: WorkerInboxMessageStatus::Queued,
+                    to_subagent_id: subagent_id.clone(),
+                    from_actor_id: "daemon".to_string(),
+                    subject: "Exercise daemon boundary".to_string(),
+                    body:
+                        "Return smoke daemon status, export, retrieval, event, and inbox evidence."
+                            .to_string(),
+                    task_id: Some(task_id.clone()),
+                    evidence_ids: Vec::new(),
+                    artifact_ids: Vec::new(),
+                    created_at: Some("2026-05-21T00:00:20Z".to_string()),
+                    metadata: self.metadata(),
+                }],
+            },
             providers: vec![Provider {
                 id: provider_id,
                 kind: ProviderKind::OpenAiCompatible,
@@ -1248,6 +1483,9 @@ pub enum CoworkDaemonSmokeError {
     UnsupportedRetrievalTarget {
         target: String,
     },
+    UnsupportedEventKind {
+        kind: String,
+    },
     HistoryRecordNotFound {
         target: &'static str,
         selector: String,
@@ -1270,6 +1508,7 @@ impl CoworkDaemonSmokeError {
             Self::UnsupportedTarget { .. } => "unsupported_target",
             Self::UnsupportedExportFormat { .. } => "unsupported_export_format",
             Self::UnsupportedRetrievalTarget { .. } => "unsupported_retrieval_target",
+            Self::UnsupportedEventKind { .. } => "unsupported_event_kind",
             Self::HistoryRecordNotFound { .. } => "history_record_not_found",
             Self::InvalidHistoryRange { .. } => "invalid_history_range",
             Self::EmptyHistoryQuery => "empty_history_query",
@@ -1298,6 +1537,11 @@ impl CoworkDaemonSmokeError {
             Self::UnsupportedRetrievalTarget { target } => ProtocolError::InvalidRequest {
                 message: format!(
                     "unsupported Cowork daemon history retrieval target '{target}'; supported targets are all, objective, task, evidence, checkpoint, artifact, subagent, provider, and browser"
+                ),
+            },
+            Self::UnsupportedEventKind { kind } => ProtocolError::InvalidRequest {
+                message: format!(
+                    "unsupported Cowork daemon event kind '{kind}'; supported kinds are parent_task_started, child_task_scheduled, child_progress, report_submitted, approval_requested, inbox_message_queued, and worker_state_changed"
                 ),
             },
             Self::HistoryRecordNotFound { target, selector } => ProtocolError::NotFound {
@@ -1361,6 +1605,9 @@ impl fmt::Display for CoworkDaemonSmokeError {
                     formatter,
                     "unsupported Cowork daemon history retrieval target '{target}'"
                 )
+            }
+            Self::UnsupportedEventKind { kind } => {
+                write!(formatter, "unsupported Cowork daemon event kind '{kind}'")
             }
             Self::HistoryRecordNotFound { target, selector } => {
                 write!(
@@ -1446,6 +1693,8 @@ mod tests {
             .validate()
             .expect("smoke subagent registry validates");
         assert_eq!(connection.snapshot.subagents.len(), 1);
+        assert_eq!(connection.snapshot.event_log.events.len(), 4);
+        assert_eq!(connection.snapshot.worker_inbox.messages.len(), 1);
         assert_eq!(connection.snapshot.providers.len(), 1);
         assert_eq!(connection.snapshot.browser.sessions.len(), 1);
     }
@@ -1498,6 +1747,14 @@ mod tests {
             "workspace://project"
         );
         assert_eq!(export_value["subagents"][0]["id"], "cowork-smoke-worker");
+        assert_eq!(
+            export_value["eventLog"]["events"][0]["id"],
+            "cowork-smoke-event-1"
+        );
+        assert_eq!(
+            export_value["workerInbox"]["messages"][0]["id"],
+            "cowork-smoke-inbox-1"
+        );
         assert_eq!(export_value["providers"][0]["id"], "cowork-smoke-provider");
         assert_eq!(
             export_value["browser"]["sessions"][0]["id"],
@@ -1538,6 +1795,8 @@ mod tests {
             "## Evidence",
             "## Checkpoints",
             "## Artifacts",
+            "## Events",
+            "## Worker Inbox",
             "## Browser",
             "## Providers",
             "## Subagents",
@@ -1547,6 +1806,8 @@ mod tests {
 
         assert!(markdown.contains("cowork-smoke-objective"));
         assert!(markdown.contains("cowork-smoke-worker"));
+        assert!(markdown.contains("cowork-smoke-event-4"));
+        assert!(markdown.contains("cowork-smoke-inbox-1"));
         assert!(markdown.contains("cowork-smoke-provider"));
         assert!(markdown.contains("cowork-smoke-browser"));
     }
@@ -1577,6 +1838,69 @@ mod tests {
             to_pretty_json(&first).expect("first json"),
             to_pretty_json(&second).expect("second json")
         );
+    }
+
+    #[test]
+    fn events_poll_uses_cursor_filter_and_can_include_inbox() {
+        let json = run_action(DaemonAction::Events(DaemonEventsOptions {
+            smoke: DaemonSmokeOptions::default(),
+            after_sequence: 1,
+            limit: 2,
+            subagent_id: Some("cowork-smoke-worker".to_string()),
+            kind: None,
+            include_inbox: true,
+        }))
+        .expect("events json");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("parse events json");
+
+        assert_eq!(value["kind"], "response");
+        assert_eq!(value["result"]["request"]["afterSequence"], 1);
+        assert_eq!(value["result"]["events"].as_array().unwrap().len(), 2);
+        assert_eq!(value["result"]["events"][0]["id"], "cowork-smoke-event-2");
+        assert_eq!(value["result"]["events"][1]["id"], "cowork-smoke-event-3");
+        assert_eq!(value["result"]["nextSequence"], 3);
+        assert_eq!(
+            value["result"]["inboxMessages"][0]["id"],
+            "cowork-smoke-inbox-1"
+        );
+    }
+
+    #[test]
+    fn events_poll_filters_kind_for_reconnect_resume() {
+        let json = run_action(DaemonAction::Events(DaemonEventsOptions {
+            smoke: DaemonSmokeOptions::default(),
+            after_sequence: 2,
+            limit: 50,
+            subagent_id: Some("cowork-smoke-worker".to_string()),
+            kind: Some("report_submitted".to_string()),
+            include_inbox: false,
+        }))
+        .expect("events json");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("parse events json");
+
+        assert_eq!(value["result"]["events"].as_array().unwrap().len(), 1);
+        assert_eq!(value["result"]["events"][0]["id"], "cowork-smoke-event-4");
+        assert_eq!(value["result"]["events"][0]["kind"], "report_submitted");
+        assert_eq!(
+            value["result"]["inboxMessages"].as_array().unwrap().len(),
+            0
+        );
+    }
+
+    #[test]
+    fn events_request_preserves_case_sensitive_subagent_id() {
+        let request = DaemonEventsOptions {
+            smoke: DaemonSmokeOptions::default(),
+            after_sequence: 0,
+            limit: 50,
+            subagent_id: Some("Worker-A".to_string()),
+            kind: None,
+            include_inbox: false,
+        }
+        .into_request()
+        .expect("event request");
+
+        assert_eq!(request.subagent_id.as_deref(), Some("Worker-A"));
     }
 
     #[test]
@@ -1679,6 +2003,21 @@ mod tests {
         assert_eq!(target.code(), "unsupported_retrieval_target");
         assert_eq!(
             target.protocol_error().code(),
+            ProtocolErrorCode::InvalidRequest
+        );
+
+        let event_kind = run_action(DaemonAction::Events(DaemonEventsOptions {
+            smoke: DaemonSmokeOptions::default(),
+            after_sequence: 0,
+            limit: 50,
+            subagent_id: None,
+            kind: Some("unknown".to_string()),
+            include_inbox: false,
+        }))
+        .unwrap_err();
+        assert_eq!(event_kind.code(), "unsupported_event_kind");
+        assert_eq!(
+            event_kind.protocol_error().code(),
             ProtocolErrorCode::InvalidRequest
         );
 
