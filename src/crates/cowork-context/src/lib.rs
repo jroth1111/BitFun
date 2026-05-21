@@ -5,6 +5,7 @@
 //! root objective observation and at least one task/evidence contract record
 //! survive trimming when they exist in the ledger.
 
+pub mod harness;
 pub mod retrieval;
 
 use cowork_ledger::{
