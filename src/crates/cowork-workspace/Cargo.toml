@@ -1,0 +1,20 @@
+[package]
+name = "cowork-workspace"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+description = "Cowork platform-agnostic local workspace authority and artifact provenance model"
+
+[lib]
+name = "cowork_workspace"
+crate-type = ["rlib"]
+
+[dependencies]
+chrono = { workspace = true }
+dunce = { workspace = true }
+image = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
